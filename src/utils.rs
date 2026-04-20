@@ -278,15 +278,28 @@ impl RetryState {
                 );
                 return true;
             }
+            error!(
+                "Exceeded {} retry attempts to {} {}: {}",
+                self.max_retries, action, path, error
+            );
+        } else {
+            error!("Failed to {} {}: {}", action, path, error);
         }
-
-        error!("Failed to {} {}: {}", action, path, error);
         false
     }
 
     /// Wait for the backoff period and increase it for next time
     pub async fn backoff(&mut self) {
-        tokio::time::sleep(tokio::time::Duration::from_millis(self.backoff_ms)).await;
+        let duration = tokio::time::Duration::from_millis(self.backoff_ms);
+
+        #[cfg(test)]
+        if let Ok(vc) = crate::tests::utils::CLOCK_OVERRIDE.try_with(|c| c.clone()) {
+            vc.sleep(duration).await;
+            self.backoff_ms = (self.backoff_ms * 2).min(5000);
+            return;
+        }
+
+        tokio::time::sleep(duration).await;
         self.backoff_ms = (self.backoff_ms * 2).min(5000); // Cap at 5 seconds
     }
 }

@@ -7,7 +7,7 @@ use crate::xdr_verify::{
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use stellar_xdr::curr::{
     AccountId, CreateAccountOp, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerHeaderExt,
     LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerScpMessages, Limits, Memo,
@@ -206,9 +206,9 @@ fn create_valid_ledger_entry(
 fn create_complete_checkpoint_data(
     checkpoint: u32,
     initial_prev_hash: [u8; 32],
-) -> HashMap<u32, LedgerVerificationData> {
+) -> BTreeMap<u32, LedgerVerificationData> {
     let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
-    let mut ledger_data = HashMap::new();
+    let mut ledger_data = BTreeMap::new();
     let mut prev_hash = initial_prev_hash;
 
     for seq in first_ledger..=last_ledger {
@@ -231,7 +231,7 @@ fn create_complete_checkpoint_data(
 fn create_checkpoint_data_missing(
     checkpoint: u32,
     missing: &[u32],
-) -> HashMap<u32, LedgerVerificationData> {
+) -> BTreeMap<u32, LedgerVerificationData> {
     let mut data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for seq in missing {
         data.remove(seq);
@@ -243,8 +243,8 @@ fn single_ledger_data(
     seq: u32,
     computed_hash: [u8; 32],
     prev_hash: [u8; 32],
-) -> HashMap<u32, LedgerVerificationData> {
-    HashMap::from([(
+) -> BTreeMap<u32, LedgerVerificationData> {
+    BTreeMap::from([(
         seq,
         LedgerVerificationData {
             computed_hash,
@@ -257,6 +257,34 @@ fn single_ledger_data(
 
 fn hash_of(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
+}
+
+fn assert_has_error(manager: &XdrVerificationManager, substring: &str) {
+    assert!(
+        manager
+            .get_errors()
+            .iter()
+            .any(|e| e.message.contains(substring)),
+        "expected an error containing {substring:?}, got: {:?}",
+        manager
+            .get_errors()
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn assert_no_errors_matching(manager: &XdrVerificationManager, substring: &str) {
+    let matching: Vec<_> = manager
+        .get_errors()
+        .iter()
+        .filter(|e| e.message.contains(substring))
+        .cloned()
+        .collect();
+    assert!(
+        matching.is_empty(),
+        "expected no errors containing {substring:?}, got: {matching:?}",
+    );
 }
 
 #[test]
@@ -289,20 +317,46 @@ fn test_parse_ledger_entries_hash_mismatch() {
     assert!(err.message.contains("hash mismatch"));
 }
 
-#[test]
-fn test_parse_ledger_entries_duplicate_sequence() {
-    let entry = create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_ledger_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate ledger entry"));
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_duplicate_sequence(#[case] file_type: &str) {
+    let frame = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(100, &[1])),
+        _ => unreachable!(),
+    };
+    let mut data = frame.clone();
+    data.extend(frame);
+    let err = match file_type {
+        "ledger" => parse_ledger_entries(&data).unwrap_err(),
+        "transaction" => parse_transaction_entries(&data).unwrap_err(),
+        "result" => parse_result_entries(&data).unwrap_err(),
+        _ => unreachable!(),
+    };
+    assert!(err.message.contains("duplicate"));
 }
 
-#[test]
-fn test_parse_ledger_entries_malformed_frame() {
-    let valid = frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32]));
-    let err = parse_ledger_entries(&valid[..valid.len() / 2]).unwrap_err();
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_malformed_frame(#[case] file_type: &str) {
+    let valid = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(100, &[1])),
+        _ => unreachable!(),
+    };
+    let truncated = &valid[..valid.len() / 2];
+    let err = match file_type {
+        "ledger" => parse_ledger_entries(truncated).unwrap_err(),
+        "transaction" => parse_transaction_entries(truncated).unwrap_err(),
+        "result" => parse_result_entries(truncated).unwrap_err(),
+        _ => unreachable!(),
+    };
     assert!(err.message.contains("failed to parse"));
 }
 
@@ -321,16 +375,6 @@ fn test_parse_result_entries_single_entry() {
         Sha256::digest(entry.tx_result_set.to_xdr(Limits::none()).unwrap()).into();
 
     assert_eq!(parsed, HashMap::from([(100, expected)]));
-}
-
-#[test]
-fn test_parse_result_entries_duplicate_sequence() {
-    let entry = result_entry(100, &[1]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_result_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate result entry"));
 }
 
 #[test]
@@ -357,16 +401,6 @@ fn test_parse_transaction_entries_v1_non_empty() {
 
     assert_eq!(parsed[&100], compute_v1_tx_set_hash(generalized).unwrap());
     assert!(!is_empty_tx_set_hash(&parsed[&100], &prev_hash));
-}
-
-#[test]
-fn test_parse_transaction_entries_duplicate_sequence() {
-    let entry = v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_transaction_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate transaction entry"));
 }
 
 #[test]
@@ -500,14 +534,12 @@ fn test_manager_records_and_verifies_checkpoint() {
 }
 
 #[rstest]
-#[case::beginning(1)]
-#[case::middle(31)]
-#[case::end(63)]
-fn test_chain_break_within_ledger_file(#[case] offset_from_first: u32) {
+#[case::beginning(127, 65)]
+#[case::middle(127, 95)]
+#[case::end(127, 127)]
+#[case::genesis(63, 2)]
+fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupted_ledger: u32) {
     let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let first_ledger = 64;
-    let corrupted_ledger = first_ledger + offset_from_first;
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     ledger_data.get_mut(&corrupted_ledger).unwrap().prev_hash = [0xff; 32];
@@ -518,20 +550,7 @@ fn test_chain_break_within_ledger_file(#[case] offset_from_first: u32) {
     assert!(manager
         .get_errors()
         .iter()
-        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")));
-}
-
-#[test]
-fn test_manager_detects_internal_genesis_chain_break() {
-    let manager = XdrVerificationManager::new();
-    let mut ledger_data = create_complete_checkpoint_data(63, [0; 32]);
-    ledger_data.get_mut(&2).unwrap().prev_hash = [0xff; 32];
-
-    manager.record_ledger_data(63, ledger_data);
-    manager.verify_and_release(63);
-
-    assert_eq!(manager.get_errors().len(), 1);
-    assert!(manager.get_errors()[0].message.contains("hash chain break"));
+        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),);
 }
 
 #[rstest]
@@ -554,6 +573,7 @@ fn test_complete_checkpoint_passes(#[case] checkpoint: u32, #[case] expected_cou
 #[case::middle_ledger(127, vec![100])]
 #[case::multiple_ledgers(127, vec![66, 67])]
 #[case::genesis_first(63, vec![1])]
+#[case::all_missing(127, (64..=127).collect())]
 fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32>) {
     let manager = XdrVerificationManager::new();
     manager.record_ledger_data(
@@ -562,21 +582,7 @@ fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32
     );
     manager.verify_and_release(checkpoint);
 
-    let combined = manager
-        .get_errors()
-        .iter()
-        .map(|e| e.message.clone())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(combined.contains("missing"));
-}
-
-#[test]
-fn test_manager_empty_checkpoint_data() {
-    let manager = XdrVerificationManager::new();
-    manager.record_ledger_data(127, HashMap::new());
-    manager.verify_and_release(127);
-    assert!(!manager.get_errors().is_empty());
+    assert_has_error(&manager, "missing");
 }
 
 #[test]
@@ -596,9 +602,7 @@ fn test_ledger_outside_expected_checkpoint_range() {
     manager.record_ledger_data(127, ledger_data);
     manager.verify_and_release(127);
 
-    assert!(manager.get_errors().iter().any(|e| e
-        .message
-        .contains("unexpected ledger entries outside range")));
+    assert_has_error(&manager, "unexpected ledger entries outside range");
 }
 
 #[rstest]
@@ -635,7 +639,7 @@ fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
     let ledger_data_63 = create_complete_checkpoint_data(63, [0; 32]);
     let last_hash_of_63 = ledger_data_63.get(&63).unwrap().computed_hash;
 
-    let mut ledger_data_127 = HashMap::new();
+    let mut ledger_data_127 = BTreeMap::new();
     let mut prev_hash = if break_chain {
         [0xff; 32]
     } else {
@@ -721,9 +725,7 @@ fn test_verify_and_release_with_only_tx_hashes_records_error_and_is_idempotent()
 
     assert_eq!(first_errors.len(), 1);
     assert_eq!(second_errors.len(), 1);
-    assert!(first_errors[0]
-        .message
-        .contains("missing ledger verification data"));
+    assert_has_error(&manager, "missing ledger verification data");
 }
 
 #[test]
@@ -732,10 +734,7 @@ fn test_verify_and_release_with_only_result_hashes_records_error() {
     manager.record_result_hashes(127, HashMap::from([(100, [1; 32])]));
     manager.verify_and_release(127);
 
-    assert_eq!(manager.get_errors().len(), 1);
-    assert!(manager.get_errors()[0]
-        .message
-        .contains("missing ledger verification data"));
+    assert_has_error(&manager, "missing ledger verification data");
 }
 
 #[test]
@@ -771,215 +770,110 @@ fn test_expected_ledger_range_large_checkpoint() {
     assert_eq!(last - first, 63);
 }
 
-#[test]
-fn test_manager_detects_tx_set_hash_mismatch() {
+#[rstest]
+#[case::tx_set("tx set")]
+#[case::result_set("result set")]
+fn test_manager_detects_hash_mismatch(#[case] hash_type: &str) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
-    let expected_tx = hash_of("expected_tx");
-    let wrong_tx = hash_of("wrong_tx");
+    let expected = hash_of("expected");
+    let wrong = hash_of("wrong");
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = expected_tx;
+        match hash_type {
+            "tx set" => data.expected_tx_set_hash = expected,
+            "result set" => data.expected_result_hash = expected,
+            _ => unreachable!(),
+        }
     }
 
-    let tx_set_hashes: HashMap<u32, [u8; 32]> =
-        ledger_data.keys().map(|&seq| (seq, wrong_tx)).collect();
+    let wrong_hashes: HashMap<u32, [u8; 32]> =
+        ledger_data.keys().map(|&seq| (seq, wrong)).collect();
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, tx_set_hashes);
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, wrong_hashes),
+        "result set" => manager.record_result_hashes(checkpoint, wrong_hashes),
+        _ => unreachable!(),
+    }
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("tx set hash mismatch")));
+    assert_has_error(&manager, &format!("{hash_type} hash mismatch"));
 }
 
-#[test]
-fn test_manager_detects_result_set_hash_mismatch() {
+#[rstest]
+#[case::tx_set("tx set")]
+#[case::result("result")]
+fn test_manager_detects_missing_entry_for_non_empty_hash(#[case] hash_type: &str) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
-    let expected_result = hash_of("expected_result");
-    let wrong_result = hash_of("wrong_result");
+    let non_empty_hash = hash_of("non_empty");
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_result_hash = expected_result;
-    }
-
-    let result_hashes: HashMap<u32, [u8; 32]> =
-        ledger_data.keys().map(|&seq| (seq, wrong_result)).collect();
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, result_hashes);
-    manager.verify_and_release(checkpoint);
-
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("result set hash mismatch")));
-}
-
-#[test]
-fn test_manager_detects_missing_tx_set_entry_for_non_empty_tx_set() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let non_empty_tx_hash = hash_of("non_empty_tx_set");
-    let non_empty_result_hash = hash_of("non_empty_result");
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = non_empty_tx_hash;
-        data.expected_result_hash = non_empty_result_hash;
+        // tx set missing-entry detection requires expected_result_hash != EMPTY_XDR_ARRAY_HASH,
+        // so both cases set non-empty hashes for both fields.
+        data.expected_tx_set_hash = non_empty_hash;
+        data.expected_result_hash = non_empty_hash;
     }
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("missing tx set entry")));
-}
-
-#[test]
-fn test_manager_detects_missing_result_entry_for_non_empty_result_set() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let non_empty_result_hash = hash_of("non_empty_result");
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_result_hash = non_empty_result_hash;
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        _ => unreachable!(),
     }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("missing result entry")));
+    assert_has_error(&manager, &format!("missing {hash_type} entry"));
 }
 
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_empty_v0_tx_set() {
+/// Missing entries should not be flagged when the expected hash indicates an empty
+/// or zero-valued set. Each case sets a different "empty" hash variant and verifies
+/// no spurious errors are produced.
+#[rstest]
+#[case::tx_set_empty_v0("tx set", "empty_v0")]
+#[case::tx_set_empty_v1("tx set", "empty_v1")]
+#[case::tx_set_zero("tx set", "zero")]
+#[case::result_empty_xdr_array("result", "empty_xdr_array")]
+#[case::result_zero("result", "zero")]
+fn test_manager_allows_missing_entry_for_empty_hash(
+    #[case] hash_type: &str,
+    #[case] empty_variant: &str,
+) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = compute_empty_v0_tx_set_hash(&data.prev_hash);
-        data.expected_result_hash = hash_of("some_result");
+        match (hash_type, empty_variant) {
+            ("tx set", "empty_v0") => {
+                data.expected_tx_set_hash = compute_empty_v0_tx_set_hash(&data.prev_hash);
+                data.expected_result_hash = hash_of("some_result");
+            }
+            ("tx set", "empty_v1") => {
+                data.expected_tx_set_hash = compute_empty_v1_tx_set_hash(&data.prev_hash);
+                data.expected_result_hash = hash_of("some_result");
+            }
+            ("tx set", "zero") => {} // defaults are already [0; 32]
+            ("result", "empty_xdr_array") => {
+                data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
+            }
+            ("result", "zero") => {} // defaults are already [0; 32]
+            _ => unreachable!(),
+        }
     }
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("tx set"))
-        .cloned()
-        .collect();
-    assert!(
-        tx_errors.is_empty(),
-        "Should allow missing tx set for empty v0 hash, got: {:?}",
-        tx_errors
-    );
-}
-
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_empty_v1_tx_set() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = compute_empty_v1_tx_set_hash(&data.prev_hash);
-        data.expected_result_hash = hash_of("some_result");
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        _ => unreachable!(),
     }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
     manager.verify_and_release(checkpoint);
 
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("tx set"))
-        .cloned()
-        .collect();
-    assert!(
-        tx_errors.is_empty(),
-        "Should allow missing tx set for empty v1 hash, got: {:?}",
-        tx_errors
-    );
-}
-
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_zero_tx_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("tx set"))
-        .cloned()
-        .collect();
-    assert!(tx_errors.is_empty());
-}
-
-#[test]
-fn test_manager_allows_missing_result_entry_for_empty_result_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
-    }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let result_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("result"))
-        .cloned()
-        .collect();
-    assert!(result_errors.is_empty());
-}
-
-#[test]
-fn test_manager_allows_missing_result_entry_for_zero_result_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let result_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("result"))
-        .cloned()
-        .collect();
-    assert!(result_errors.is_empty());
+    assert_no_errors_matching(&manager, hash_type);
 }
 
 #[test]
@@ -1005,55 +899,25 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
 
     // The EMPTY_XDR_ARRAY_HASH result hash suppresses the missing tx set error
     // because no results implies no transactions, regardless of tx_set_hash format
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("missing tx set entry"))
-        .cloned()
-        .collect();
-    assert!(
-        tx_errors.is_empty(),
-        "EMPTY_XDR_ARRAY_HASH result hash should suppress missing tx set error, got: {:?}",
-        tx_errors
-    );
+    assert_no_errors_matching(&manager, "missing tx set entry");
 }
 
-#[test]
-fn test_parse_transaction_entries_malformed_frame() {
-    let entry = v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)]);
-    let valid = frame_xdr(&entry);
-    let err = parse_transaction_entries(&valid[..valid.len() / 2]).unwrap_err();
-    assert!(err.message.contains("failed to parse"));
-}
-
-#[test]
-fn test_parse_result_entries_malformed_frame() {
-    let entry = result_entry(100, &[1]);
-    let valid = frame_xdr(&entry);
-    let err = parse_result_entries(&valid[..valid.len() / 2]).unwrap_err();
-    assert!(err.message.contains("failed to parse"));
-}
-
-#[test]
-fn test_parse_transaction_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = v0_history_entry(200, [0; 32], vec![tx_v0_envelope(1)]);
-    let data = frame_xdr(&entry);
-    let err = parse_transaction_entries_for_checkpoint(&data, Some(127)).unwrap_err();
-    assert!(err.message.contains("outside expected checkpoint range"));
-}
-
-#[test]
-fn test_parse_result_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = result_entry(200, &[1]);
-    let data = frame_xdr(&entry);
-    let err = parse_result_entries_for_checkpoint(&data, Some(127)).unwrap_err();
-    assert!(err.message.contains("outside expected checkpoint range"));
-}
-
-#[test]
-fn test_parse_ledger_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = create_valid_ledger_entry(200, [0; 32], [0; 32], [0; 32]);
-    let data = frame_xdr(&entry);
-    let err = parse_ledger_entries_for_checkpoint(&data, Some(127)).unwrap_err();
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_ledger_outside_checkpoint_range(#[case] file_type: &str) {
+    let data = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(200, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(200, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(200, &[1])),
+        _ => unreachable!(),
+    };
+    let err = match file_type {
+        "ledger" => parse_ledger_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        "transaction" => parse_transaction_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        "result" => parse_result_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        _ => unreachable!(),
+    };
     assert!(err.message.contains("outside expected checkpoint range"));
 }

@@ -434,116 +434,121 @@ async fn test_mirror_verify_valid_archive(#[case] archive_type: ArchiveType) {
 }
 
 //=============================================================================
-// Ledger File Corruption Tests
+// XDR File Corruption Tests (Scan)
 //
-// Ledger files (ledger-*.xdr.gz) are the foundation of archive verification:
-//   - Contain LedgerHeaderHistoryEntry records with hash chain
-//   - Store expected hashes for transaction and result files
-//   - Must be parseable for any verification to proceed
-//
-// Corruption methods tested:
-//   - InvalidGzip: File isn't valid gzip (download truncation, storage error)
-//   - WrongContent: Valid gzip but wrong XDR content (file swap, mismatch)
-//   - FlippedBytes: Valid structure but corrupted bytes (bit rot, tampering)
+// Tests that --verify detects corruption across all XDR file types (ledger,
+// transactions, results) and all corruption methods (InvalidGzip, WrongContent,
+// FlippedBytes) for both archive formats.
 //=============================================================================
 
-// Verifies --verify detects various types of ledger file corruption.
 #[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
+#[case::pubnet_ledger_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_ledger_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_ledger_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::pubnet_transactions_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_transactions_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_transactions_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::pubnet_results_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_results_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_results_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_ledger_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_ledger_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_ledger_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_transactions_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_transactions_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_transactions_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_results_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_results_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_results_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::FlippedBytes
+)]
 #[tokio::test]
-async fn test_scan_verify_detects_corrupt_ledger(
+async fn test_scan_verify_detects_corrupt_xdr(
     #[case] archive_type: ArchiveType,
+    #[case] file_type: XdrFileType,
     #[case] corruption: CorruptionMethod,
 ) {
     let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Ledger, corruption);
+        setup_corrupted_xdr_archive(archive_type, file_type, corruption);
     let archive_url = format!("file://{}", archive_path.display());
 
     let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
 
     assert!(
         result.is_err(),
-        "Scan --verify should fail on {} ledger corruption ({}) but succeeded",
+        "Scan --verify should fail on {} {} corruption ({}) but succeeded",
         archive_type.name(),
-        corruption.name()
-    );
-}
-
-//=============================================================================
-// Transactions File Corruption Tests
-//
-// Transaction files (transactions-*.xdr.gz) contain TransactionHistoryEntry records.
-// Each entry has a transaction set whose hash must match the ledger header's tx_set_hash.
-// Corruption here is detected via:
-//   - Parse failure (InvalidGzip, WrongContent)
-//   - Hash mismatch (FlippedBytes changes computed hash, won't match ledger header)
-//=============================================================================
-
-// Verifies --verify detects various types of transaction file corruption.
-#[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
-#[tokio::test]
-async fn test_scan_verify_detects_corrupt_transactions(
-    #[case] archive_type: ArchiveType,
-    #[case] corruption: CorruptionMethod,
-) {
-    let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Transactions, corruption);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} transactions corruption ({}) but succeeded",
-        archive_type.name(),
-        corruption.name()
-    );
-}
-
-//=============================================================================
-// Results File Corruption Tests
-//
-// Result files (results-*.xdr.gz) contain TransactionHistoryResultEntry records.
-// Each entry has a result set whose hash must match the ledger header's tx_set_result_hash.
-// Same corruption detection mechanisms as transaction files:
-//   - Parse failure catches structural corruption
-//   - Hash mismatch catches content corruption
-//=============================================================================
-
-// Verifies --verify detects various types of result file corruption.
-#[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
-#[tokio::test]
-async fn test_scan_verify_detects_corrupt_results(
-    #[case] archive_type: ArchiveType,
-    #[case] corruption: CorruptionMethod,
-) {
-    let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Results, corruption);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} results corruption ({}) but succeeded",
-        archive_type.name(),
+        file_type.name(),
         corruption.name()
     );
 }
@@ -622,26 +627,6 @@ fn corrupt_result_hash_in_ledger(archive_path: &Path, archive_type: ArchiveType)
     std::fs::write(&ledger_file, compressed).expect("Failed to write corrupted file");
 }
 
-// Verifies --verify detects when ledger header's expected result hash doesn't match
-// the actual hash computed from the result file.
-#[rstest]
-#[case::pubnet_old_txset(ArchiveType::PubnetOldTxset)]
-#[case::testnet_small(ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_scan_verify_detects_result_hash_mismatch(#[case] archive_type: ArchiveType) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_result_hash_in_ledger(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} result hash mismatch but succeeded",
-        archive_type.name()
-    );
-}
-
 //=============================================================================
 // Hash Chain Verification Tests
 //
@@ -689,25 +674,6 @@ fn corrupt_prev_ledger_hash(archive_path: &Path, archive_type: ArchiveType) {
         .expect("Failed to write corrupted data");
     let compressed = encoder.finish().expect("Failed to finish compression");
     std::fs::write(second_file, compressed).expect("Failed to write corrupted file");
-}
-
-// Verifies --verify detects when the hash chain between ledgers is broken.
-#[rstest]
-#[case::pubnet_old_txset(ArchiveType::PubnetOldTxset)]
-#[case::testnet_small(ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_scan_verify_detects_hash_chain_break(#[case] archive_type: ArchiveType) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_prev_ledger_hash(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} hash chain break but succeeded",
-        archive_type.name()
-    );
 }
 
 //=============================================================================
@@ -896,44 +862,6 @@ async fn test_verify_detects_result_hash_mismatch_in_scan_and_mirror(
 }
 
 #[tokio::test]
-async fn test_mirror_verify_removes_corrupt_written_xdr_file() {
-    let (_temp_src, archive_path) = setup_corrupted_xdr_archive(
-        ArchiveType::PubnetOldTxset,
-        XdrFileType::Transactions,
-        CorruptionMethod::WrongContent,
-    );
-    let corrupt_file = get_first_file_in_range(
-        &archive_path,
-        ArchiveType::PubnetOldTxset,
-        XdrFileType::Transactions.pattern(),
-    );
-
-    let temp_dest = TempDir::new().expect("Failed to create temp dir");
-    let src_url = format!("file://{}", archive_path.display());
-    let dest_url = format!("file://{}", temp_dest.path().display());
-
-    let result = run_mirror(configure_mirror(
-        &src_url,
-        &dest_url,
-        ArchiveType::PubnetOldTxset,
-        true,
-        true,
-    ))
-    .await;
-
-    assert!(
-        result.is_err(),
-        "Mirror should fail on corrupt transactions file"
-    );
-
-    let relative = corrupt_file.strip_prefix(&archive_path).unwrap();
-    assert!(
-        !temp_dest.path().join(relative).exists(),
-        "corrupt xdr file should be cleaned up after mirror verification failure"
-    );
-}
-
-#[tokio::test]
 async fn test_scan_verify_fails_with_multiple_corrupt_files_same_checkpoint() {
     let (_temp_dir, archive_path) = setup_archive(ArchiveType::PubnetOldTxset);
     let ledger_file = get_first_file_in_range(
@@ -1018,32 +946,24 @@ fn write_ledger_entries_to_file(path: &Path, entries: &[LedgerHeaderHistoryEntry
     std::fs::write(path, compressed).expect("Failed to write file");
 }
 
-/// Modify all entries in a ledger file: set tx_set_hash to a wrong value,
-/// recompute each entry's hash, and fix the internal prev-hash chain so
+/// Modify all entries in a ledger file: set the specified hash field to a wrong
+/// value, recompute each entry's hash, and fix the internal prev-hash chain so
 /// the file passes per-entry and intra-checkpoint validation. The mismatch
-/// surfaces only when cross-checking against the transactions file.
-fn corrupt_tx_set_hash_preserving_entry_hash(archive_path: &Path, archive_type: ArchiveType) {
+/// surfaces only during cross-file verification.
+fn corrupt_ledger_hash_field_preserving_entry_hash(
+    archive_path: &Path,
+    archive_type: ArchiveType,
+    field: &str,
+) {
     let ledger_file = get_first_file_in_range(archive_path, archive_type, "/ledger-");
     let mut entries = read_and_parse_ledger_file(&ledger_file);
 
     for i in 0..entries.len() {
-        entries[i].header.scp_value.tx_set_hash = Hash([0xDE; 32]);
-        if i > 0 {
-            entries[i].header.previous_ledger_hash = entries[i - 1].hash.clone();
+        match field {
+            "tx_set" => entries[i].header.scp_value.tx_set_hash = Hash([0xDE; 32]),
+            "result" => entries[i].header.tx_set_result_hash = Hash([0xDE; 32]),
+            _ => unreachable!(),
         }
-        recompute_entry_hash(&mut entries[i]);
-    }
-
-    write_ledger_entries_to_file(&ledger_file, &entries);
-}
-
-/// Same as above but for tx_set_result_hash.
-fn corrupt_result_hash_preserving_entry_hash(archive_path: &Path, archive_type: ArchiveType) {
-    let ledger_file = get_first_file_in_range(archive_path, archive_type, "/ledger-");
-    let mut entries = read_and_parse_ledger_file(&ledger_file);
-
-    for i in 0..entries.len() {
-        entries[i].header.tx_set_result_hash = Hash([0xDE; 32]);
         if i > 0 {
             entries[i].header.previous_ledger_hash = entries[i - 1].hash.clone();
         }
@@ -1089,69 +1009,40 @@ fn corrupt_cross_checkpoint_boundary(archive_path: &Path, archive_type: ArchiveT
 //=============================================================================
 
 #[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
+#[case::tx_set_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "tx_set")]
+#[case::tx_set_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "tx_set")]
+#[case::tx_set_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "tx_set")]
+#[case::tx_set_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "tx_set")]
+#[case::result_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "result")]
+#[case::result_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "result")]
+#[case::result_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "result")]
+#[case::result_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "result")]
+#[case::chain_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "chain")]
+#[case::chain_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "chain")]
+#[case::chain_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "chain")]
+#[case::chain_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "chain")]
 #[tokio::test]
-async fn test_verify_detects_true_tx_set_hash_mismatch_in_scan_and_mirror(
+async fn test_verify_detects_true_cross_file_mismatch(
     #[case] op: VerifyOperation,
     #[case] archive_type: ArchiveType,
+    #[case] corruption_type: &str,
 ) {
     let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_tx_set_hash_preserving_entry_hash(&archive_path, archive_type);
+    match corruption_type {
+        "tx_set" | "result" => corrupt_ledger_hash_field_preserving_entry_hash(
+            &archive_path,
+            archive_type,
+            corruption_type,
+        ),
+        "chain" => corrupt_cross_checkpoint_boundary(&archive_path, archive_type),
+        _ => unreachable!(),
+    }
     let archive_url = format!("file://{}", archive_path.display());
 
     let result = op.run_with_verify(&archive_url, archive_type, true).await;
     assert!(
         result.is_err(),
-        "{:?} --verify should fail on {} true tx set hash mismatch",
-        op,
-        archive_type.name()
-    );
-}
-
-#[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_verify_detects_true_result_hash_mismatch_in_scan_and_mirror(
-    #[case] op: VerifyOperation,
-    #[case] archive_type: ArchiveType,
-) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_result_hash_preserving_entry_hash(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = op.run_with_verify(&archive_url, archive_type, true).await;
-    assert!(
-        result.is_err(),
-        "{:?} --verify should fail on {} true result hash mismatch",
-        op,
-        archive_type.name()
-    );
-}
-
-#[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_verify_detects_true_cross_checkpoint_chain_break_in_scan_and_mirror(
-    #[case] op: VerifyOperation,
-    #[case] archive_type: ArchiveType,
-) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_cross_checkpoint_boundary(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = op.run_with_verify(&archive_url, archive_type, true).await;
-    assert!(
-        result.is_err(),
-        "{:?} --verify should fail on {} cross-checkpoint chain break",
+        "{:?} --verify should fail on {} true {corruption_type} mismatch",
         op,
         archive_type.name()
     );
