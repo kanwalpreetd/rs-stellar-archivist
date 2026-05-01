@@ -2,10 +2,9 @@ use crate::cli::{Error, GlobalArgs};
 use crate::{
     pipeline::{Pipeline, PipelineConfig},
     scan_operation::ScanOperation,
-    utils,
+    storage, utils,
 };
 use clap::Parser;
-use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -40,23 +39,18 @@ impl ScanCmd {
             args.storage_config.max_retries as u32,
             args.storage_config.retry_min_delay.as_millis() as u64,
             args.verify,
-        )
-        .await?;
+        );
 
-        // Configure the pipeline with low/high bounds and storage config
+        let src_store = storage::from_url_with_config(&self.archive, &args.storage_config)
+            .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;
+
         let pipeline_config = PipelineConfig {
-            source: self.archive.clone(),
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
             storage_config: args.storage_config,
         };
 
-        // Create and run the pipeline
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(utils::map_pipeline_error)?,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

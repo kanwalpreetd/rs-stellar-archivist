@@ -1,3 +1,12 @@
+// Raised from the default of 128 to accommodate deeply nested OpenDAL layer
+// types. Each .layer() call (Timeout, ConcurrentLimit, Logging, HttpClient,
+// Throttle) wraps the previous accessor in another generic struct. Async
+// methods in each layer compile to state machines that embed the inner layer's
+// future, so the compiler must recurse through all layers to compute type
+// layouts. The SFTP backend with all layers stacked pushes the nesting past 128
+// (the compiler reports a depth increase of ~130 for a single method like
+// create_dir). 256 gives comfortable headroom.
+#![recursion_limit = "256"]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
@@ -63,7 +72,6 @@ pub mod test_helpers {
         scan_operation::ScanOperation,
         storage::StorageConfig,
     };
-    use std::sync::Arc;
     use std::time::Duration;
 
     /// Create a `StorageConfig` suitable for testing (generous timeouts, limited concurrency)
@@ -241,21 +249,20 @@ pub mod test_helpers {
             config.storage_config.max_retries as u32,
             config.storage_config.retry_min_delay.as_millis() as u64,
             config.verify,
-        )
-        .await?;
+        );
+
+        let src_store =
+            crate::storage::from_url_with_config(&config.archive, &config.storage_config).map_err(
+                |e| crate::Error::Other(format!("Failed to create source backend: {e}")),
+            )?;
 
         let pipeline_config = PipelineConfig {
-            source: config.archive,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(crate::utils::map_pipeline_error)?,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
         pipeline
             .run()
             .await
@@ -263,29 +270,40 @@ pub mod test_helpers {
     }
 
     pub async fn run_mirror(config: MirrorConfig) -> Result<(), crate::Error> {
+        let src_store = crate::storage::from_url_with_config(&config.src, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create source backend: {e}"))
+        })?;
+
+        let dst_store = crate::storage::from_url_with_config(&config.dst, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create destination backend: {e}"))
+        })?;
+
+        if !dst_store.supports_writes() {
+            return Err(crate::Error::Other(format!(
+                "Destination does not support writes: {}",
+                config.dst
+            )));
+        }
+
         let operation = MirrorOperation::new(
-            &config.dst,
+            dst_store.clone(),
             config.overwrite,
             config.low,
             config.high,
             config.allow_mirror_gaps,
             &config.storage_config,
             config.verify,
-        )
-        .await?;
+        );
 
         let pipeline_config = PipelineConfig {
-            source: config.src,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(crate::utils::map_pipeline_error)?,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
         pipeline
             .run()
             .await

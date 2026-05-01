@@ -14,6 +14,7 @@ use crate::{
     test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig},
 };
 use axum::{routing::get_service, Router};
+use rstest::rstest;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -621,6 +622,77 @@ async fn test_mirror_replaces_empty_files() {
     );
 }
 
+/// Verifies that a process crash during non-atomic writes doesn't leave
+/// partial files at the final path, preventing silent corruption on resume.
+///
+/// Two cases cover the two distinct write paths in `MirrorOperation::process_object`:
+/// - `no_verify`: ledger files go through `OpendalStore::copy_from_reader_direct`
+///   (storage.rs) — pure tokio::fs temp+rename.
+/// - `verify`: ledger files go through `xdr_verify::verify_and_write_xdr` —
+///   OpenDAL writer/sink + tokio::fs::rename at commit.
+///
+/// Scenario: mirror checkpoints 63 and 127, simulate a crash on a ledger file
+/// at checkpoint 127 by deleting the final file and leaving a truncated `.tmp`
+/// behind (matching what a killed temp+rename would leave). Resume and confirm
+/// the file is re-downloaded correctly, the stale `.tmp` is gone, and
+/// `.well-known` only advances once everything succeeds.
+#[rstest]
+#[case::no_verify(false)]
+#[case::verify(true)]
+#[tokio::test]
+async fn test_mirror_resume_after_crash_redownloads_missing_file(#[case] verify: bool) {
+    let src = file_url_from_path(&testnet_small_archive_path());
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("mirror_dest");
+    let dst = file_url_from_path(&dest_path);
+
+    let make_config = || {
+        let mut c = MirrorConfig::new(&src, &dst).skip_optional().high(127);
+        if verify {
+            c = c.verify();
+        }
+        c
+    };
+
+    // Mirror checkpoints 63 and 127
+    run_mirror(make_config())
+        .await
+        .expect("Initial mirror should succeed");
+
+    // Record correct content of a ledger file at checkpoint 127
+    let ledger_file = dest_path.join("ledger/00/00/00/ledger-0000007f.xdr.gz");
+    let correct_content = std::fs::read(&ledger_file).unwrap();
+    assert!(correct_content.len() > 10);
+
+    // Simulate crash: remove the final file, leave a truncated .tmp behind.
+    // Both write paths use "{final}.tmp" as the temp name.
+    let tmp_file = ledger_file.with_added_extension("tmp");
+    std::fs::write(&tmp_file, &correct_content[..5]).unwrap();
+    std::fs::remove_file(&ledger_file).unwrap();
+
+    // Roll back .well-known to checkpoint 63 so resume re-processes checkpoint 127.
+    let wellknown = dest_path.join(".well-known/stellar-history.json");
+    let history_63 = dest_path.join("history/00/00/00/history-0000003f.json");
+    std::fs::copy(&history_63, &wellknown).unwrap();
+
+    // Resume — should re-download the missing file at checkpoint 127
+    run_mirror(make_config())
+        .await
+        .expect("Resume mirror should succeed");
+
+    // Final file should exist with correct content
+    let resumed_content = std::fs::read(&ledger_file).unwrap();
+    assert_eq!(resumed_content, correct_content);
+
+    // Stale .tmp should be gone (overwritten by the new write's temp, then renamed)
+    assert!(!tmp_file.exists(), "Stale .tmp should not remain");
+
+    // .well-known should now be at checkpoint 127
+    let wk_content = std::fs::read_to_string(&wellknown).unwrap();
+    let wk: serde_json::Value = serde_json::from_str(&wk_content).unwrap();
+    assert_eq!(wk["currentLedger"].as_u64().unwrap(), 127);
+}
+
 //=============================================================================
 // .well-known update tests
 //=============================================================================
@@ -823,10 +895,10 @@ async fn test_mirror_race_condition_with_advancing_archive() {
                 let count = request_count.fetch_add(1, Ordering::Relaxed);
                 let well_known_content = if count >= advance_threshold {
                     // Return advanced .well-known after threshold
-                    advanced_well_known.to_string()
+                    advanced_well_known.clone()
                 } else {
                     // Initial reads get initial .well-known
-                    initial_well_known.to_string()
+                    initial_well_known.clone()
                 };
                 async move { well_known_content }
             }),

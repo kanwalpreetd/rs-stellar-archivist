@@ -44,6 +44,10 @@ pub(crate) const EMPTY_XDR_ARRAY_HASH: [u8; 32] = [
 const DECOMPRESS_BUFFER_SIZE: usize = 64 * 1024;
 const CHANNEL_CAPACITY: usize = 64;
 
+/// Inclusive `(first_ledger, last_ledger)` range covered by a given checkpoint.
+///
+/// - **Genesis checkpoint (63)**: `(1, 63)` — ledger 0 has no header entry.
+/// - **All others**: `(checkpoint - 63, checkpoint)` — 64 ledgers per checkpoint.
 pub(crate) fn expected_ledger_range(checkpoint: u32) -> (u32, u32) {
     if checkpoint == GENESIS_CHECKPOINT_LEDGER {
         (1, GENESIS_CHECKPOINT_LEDGER)
@@ -120,6 +124,7 @@ pub struct XdrVerificationManager {
 }
 
 impl XdrVerificationManager {
+    /// Construct an empty manager with no pending data, boundaries, or errors.
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
@@ -128,18 +133,26 @@ impl XdrVerificationManager {
         }
     }
 
+    /// Record per-ledger data parsed from the **ledger** file of a checkpoint.
+    /// Overwrites any previously recorded ledger data for the same checkpoint.
+    /// Pair with `record_tx_set_hashes` and `record_result_hashes`, then call
+    /// [`verify_and_release`](Self::verify_and_release) once all three are in.
     pub fn record_ledger_data(&self, checkpoint: u32, data: BTreeMap<u32, LedgerVerificationData>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.ledger_data = Some(data);
     }
 
+    /// Record per-ledger transaction-set hashes parsed from the **transactions**
+    /// file of a checkpoint. See [`record_ledger_data`](Self::record_ledger_data).
     pub fn record_tx_set_hashes(&self, checkpoint: u32, hashes: HashMap<u32, [u8; 32]>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.tx_set_hashes = Some(hashes);
     }
 
+    /// Record per-ledger result-set hashes parsed from the **results** file of
+    /// a checkpoint. See [`record_ledger_data`](Self::record_ledger_data).
     pub fn record_result_hashes(&self, checkpoint: u32, hashes: HashMap<u32, [u8; 32]>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
@@ -150,53 +163,78 @@ impl XdrVerificationManager {
     ///
     /// Runs (in order): completeness check, tx set hash cross-check, result hash
     /// cross-check, internal hash chain, then stores the first/last boundary hashes
-    /// for later cross-checkpoint verification. Errors are accumulated, not returned —
-    /// retrieve via [`get_errors`](Self::get_errors).
+    /// for later cross-checkpoint verification. Errors are accumulated in
+    /// [`get_errors`](Self::get_errors) **and** returned to the caller so they can
+    /// observe per-checkpoint outcomes (used by repair to drive its retry phase).
     ///
-    /// No-op if no data was recorded for this checkpoint. If ledger data is missing
-    /// but tx/result data exists, records a warning and skips all checks.
-    pub fn verify_and_release(&self, checkpoint: u32) {
+    /// No-op (returns empty Vec) if no data was recorded for this checkpoint.
+    /// If ledger data is missing but tx/result data exists, records a warning
+    /// error and returns it.
+    pub fn verify_and_release(&self, checkpoint: u32) -> Vec<VerificationError> {
         let data = {
             let mut pending = self.pending.lock().unwrap();
             pending.remove(&checkpoint)
         };
 
         let Some(data) = data else {
-            return;
+            return Vec::new();
         };
 
         let Some(ledger_data) = data.ledger_data else {
             let err_msg = "missing ledger verification data for checkpoint";
             warn!("Checkpoint {checkpoint}: skipping cross-verification because {err_msg}");
-            self.errors.lock().unwrap().push(VerificationError {
+            let err = VerificationError {
                 checkpoint,
                 ledger_seq: None,
                 message: err_msg.to_string(),
-            });
-            return;
+            };
+            self.errors.lock().unwrap().push(err.clone());
+            return vec![err];
         };
 
-        self.verify_checkpoint_completeness(checkpoint, &ledger_data);
+        let mut errors = Vec::new();
+        errors.extend(Self::verify_checkpoint_completeness(
+            checkpoint,
+            &ledger_data,
+        ));
 
         if let Some(tx_set_hashes) = data.tx_set_hashes {
-            self.verify_tx_set_hashes_internal(checkpoint, &ledger_data, &tx_set_hashes);
+            errors.extend(Self::verify_tx_set_hashes_internal(
+                checkpoint,
+                &ledger_data,
+                &tx_set_hashes,
+            ));
         }
 
         if let Some(result_hashes) = data.result_hashes {
-            self.verify_result_hashes_internal(checkpoint, &ledger_data, &result_hashes);
+            errors.extend(Self::verify_result_hashes_internal(
+                checkpoint,
+                &ledger_data,
+                &result_hashes,
+            ));
         }
 
-        self.verify_internal_chain(checkpoint, &ledger_data);
+        errors.extend(Self::verify_internal_chain(checkpoint, &ledger_data));
         self.store_boundary(checkpoint, &ledger_data);
+
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors.iter().cloned());
+        }
+        errors
     }
 
-    // verifies entries in the `ledger_data` matches exactly to the ledgers in
-    // this `checkpoint`
+    /// Verify that `ledger_data` covers exactly the ledger sequences expected
+    /// for this checkpoint (per [`expected_ledger_range`]).
+    ///
+    /// Returns two error kinds:
+    /// - **Unexpected**: ledger entries with sequences outside the expected range
+    /// - **Missing**: ledger sequences in the expected range with no entry
+    ///   (truncated to the first 5 + a count when more than 10 are missing)
     fn verify_checkpoint_completeness(
-        &self,
         checkpoint: u32,
         ledger_data: &BTreeMap<u32, LedgerVerificationData>,
-    ) {
+    ) -> Vec<VerificationError> {
+        let mut errors = Vec::new();
         let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
         let range = first_ledger..=last_ledger;
         let fmt_list = |seqs: &[u32]| {
@@ -218,7 +256,7 @@ impl XdrVerificationManager {
                 fmt_list(&unexpected),
             );
             error!("Checkpoint {checkpoint}: {err_msg}");
-            self.errors.lock().unwrap().push(VerificationError {
+            errors.push(VerificationError {
                 checkpoint,
                 ledger_seq: unexpected.first().copied(),
                 message: err_msg,
@@ -243,20 +281,32 @@ impl XdrVerificationManager {
                 last_ledger - first_ledger + 1,
             );
             error!("Checkpoint {checkpoint}: {err_msg}");
-            self.errors.lock().unwrap().push(VerificationError {
+            errors.push(VerificationError {
                 checkpoint,
                 ledger_seq: missing.first().copied(),
                 message: err_msg,
             });
         }
+        errors
     }
 
+    /// Cross-verify per-ledger tx-set hashes from the **transactions** file
+    /// against the `expected_tx_set_hash` field embedded in the ledger header.
+    ///
+    /// For each ledger sequence in `ledger_data`:
+    /// - **Mismatch**: actual tx-set hash differs from `expected_tx_set_hash`
+    /// - **Missing**: no entry in `tx_set_hashes`, *and* the ledger isn't
+    ///   genuinely empty. A missing entry is acceptable only when both the
+    ///   expected result hash equals [`EMPTY_XDR_ARRAY_HASH`] *and* the
+    ///   expected tx-set hash is one of the recognized "empty tx set"
+    ///   sentinels (see [`is_empty_tx_set_hash`]) — stellar-core omits empty
+    ///   tx-set entries from the transactions file.
     fn verify_tx_set_hashes_internal(
-        &self,
         checkpoint: u32,
         ledger_data: &BTreeMap<u32, LedgerVerificationData>,
         tx_set_hashes: &HashMap<u32, [u8; 32]>,
-    ) {
+    ) -> Vec<VerificationError> {
+        let mut errors = Vec::new();
         for (&seq, data) in ledger_data {
             let expected = data.expected_tx_set_hash;
 
@@ -283,21 +333,30 @@ impl XdrVerificationManager {
 
             if let Some(err_msg) = err_msg {
                 error!("Ledger {seq}: {err_msg}");
-                self.errors.lock().unwrap().push(VerificationError {
+                errors.push(VerificationError {
                     checkpoint,
                     ledger_seq: Some(seq),
                     message: err_msg,
                 });
             }
         }
+        errors
     }
 
+    /// Cross-verify per-ledger result-set hashes from the **results** file
+    /// against the `expected_result_hash` field embedded in the ledger header.
+    ///
+    /// For each ledger sequence in `ledger_data`:
+    /// - **Mismatch**: actual result-set hash differs from `expected_result_hash`
+    /// - **Missing**: no entry in `result_hashes` *and* `expected_result_hash`
+    ///   is non-zero and not [`EMPTY_XDR_ARRAY_HASH`] (those two values mark
+    ///   "no result entry expected" and are tolerated as missing).
     fn verify_result_hashes_internal(
-        &self,
         checkpoint: u32,
         ledger_data: &BTreeMap<u32, LedgerVerificationData>,
         result_hashes: &HashMap<u32, [u8; 32]>,
-    ) {
+    ) -> Vec<VerificationError> {
+        let mut errors = Vec::new();
         for (&seq, data) in ledger_data {
             let expected = data.expected_result_hash;
 
@@ -322,20 +381,30 @@ impl XdrVerificationManager {
 
             if let Some(err_msg) = err_msg {
                 error!("Ledger {seq}: {err_msg}");
-                self.errors.lock().unwrap().push(VerificationError {
+                errors.push(VerificationError {
                     checkpoint,
                     ledger_seq: Some(seq),
                     message: err_msg,
                 });
             }
         }
+        errors
     }
 
+    /// Verify the hash chain *within* a single checkpoint.
+    ///
+    /// For each adjacent ledger pair `(prev, curr)` in `ledger_data`:
+    /// - **Consecutive**: `curr.seq == prev.seq + 1` (else "missing predecessor")
+    /// - **Linked**: `curr.prev_hash == prev.computed_hash` (else "hash chain break")
+    ///
+    /// The link across checkpoint boundaries (this checkpoint's first ledger ↔
+    /// prior checkpoint's last) is handled separately by
+    /// [`verify_checkpoint_chain`](Self::verify_checkpoint_chain).
     fn verify_internal_chain(
-        &self,
         checkpoint: u32,
         ledger_data: &BTreeMap<u32, LedgerVerificationData>,
-    ) {
+    ) -> Vec<VerificationError> {
+        let mut errors = Vec::new();
         let entries: Vec<_> = ledger_data.iter().collect();
 
         for pair in entries.windows(2) {
@@ -366,15 +435,27 @@ impl XdrVerificationManager {
 
             if let Some(err_msg) = err_msg {
                 error!("Checkpoint {checkpoint}: {err_msg}");
-                self.errors.lock().unwrap().push(VerificationError {
+                errors.push(VerificationError {
                     checkpoint,
                     ledger_seq,
                     message: err_msg,
                 });
             }
         }
+        errors
     }
 
+    /// Stash the first/last ledger hashes of this checkpoint into
+    /// `self.boundaries` so that [`verify_checkpoint_chain`](Self::verify_checkpoint_chain)
+    /// can later check hash continuity across adjacent checkpoints.
+    ///
+    /// Stores:
+    /// - `first_prev_hash` = first entry's `previous_ledger_hash`
+    ///   (must equal the prior checkpoint's `last_computed_hash`)
+    /// - `last_computed_hash` = last entry's `computed_hash` (the SHA-256 of
+    ///   that ledger's header, which the next checkpoint will reference)
+    ///
+    /// No-op when `ledger_data` is empty (nothing to bracket).
     fn store_boundary(&self, checkpoint: u32, ledger_data: &BTreeMap<u32, LedgerVerificationData>) {
         let (Some((_, first_data)), Some((_, last_data))) =
             (ledger_data.first_key_value(), ledger_data.last_key_value())
@@ -401,19 +482,15 @@ impl XdrVerificationManager {
         let boundaries = self.boundaries.lock().unwrap();
         let mut chain_errors = Vec::new();
 
-        let mut checkpoints: Vec<_> = boundaries.keys().copied().collect();
-        checkpoints.sort_unstable();
+        let entries: Vec<_> = boundaries.iter().collect();
 
-        for window in checkpoints.windows(2) {
-            let prev_checkpoint = window[0];
-            let curr_checkpoint = window[1];
+        for window in entries.windows(2) {
+            let (&prev_checkpoint, prev_boundary) = window[0];
+            let (&curr_checkpoint, curr_boundary) = window[1];
 
             if curr_checkpoint != prev_checkpoint + CHECKPOINT_FREQUENCY {
                 continue;
             }
-
-            let prev_boundary = &boundaries[&prev_checkpoint];
-            let curr_boundary = &boundaries[&curr_checkpoint];
 
             if curr_boundary.first_prev_hash != prev_boundary.last_computed_hash {
                 let first_ledger = curr_checkpoint.saturating_sub(63);
@@ -435,6 +512,8 @@ impl XdrVerificationManager {
         chain_errors
     }
 
+    /// Snapshot of all verification errors accumulated so far. Each call
+    /// returns a fresh `Vec`; the manager retains the underlying state.
     pub fn get_errors(&self) -> Vec<VerificationError> {
         self.errors.lock().unwrap().clone()
     }
@@ -459,6 +538,8 @@ pub fn parse_ledger_entries(
     parse_ledger_entries_for_checkpoint(decompressed_data, None)
 }
 
+/// Same as [`parse_ledger_entries`] but additionally rejects ledger sequences
+/// outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_ledger_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
@@ -535,10 +616,14 @@ pub(crate) fn parse_ledger_entries_for_checkpoint(
     Ok(data)
 }
 
+/// Hash of an empty V0 `TransactionSet`: `SHA256(previous_ledger_hash)` —
+/// equivalent to the V0 hash recipe with zero transactions concatenated.
 pub(crate) fn compute_empty_v0_tx_set_hash(previous_ledger_hash: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(previous_ledger_hash).into()
 }
 
+/// Hash of an empty V1 `GeneralizedTransactionSet`: SHA-256 of the
+/// XDR-serialized struct with `previous_ledger_hash` set and no phases.
 pub(crate) fn compute_empty_v1_tx_set_hash(previous_ledger_hash: &[u8; 32]) -> [u8; 32] {
     let empty_v1 = GeneralizedTransactionSet::V1(TransactionSetV1 {
         previous_ledger_hash: Hash(*previous_ledger_hash),
@@ -550,6 +635,16 @@ pub(crate) fn compute_empty_v1_tx_set_hash(previous_ledger_hash: &[u8; 32]) -> [
     Sha256::digest(&xdr).into()
 }
 
+/// Whether `expected` is one of the recognized "no transactions in this ledger"
+/// markers, given the ledger's `prev_hash`.
+///
+/// Treated as empty if `expected` matches any of:
+/// - all-zero hash (`[0; 32]`)
+/// - [`compute_empty_v0_tx_set_hash`]`(prev_hash)` — empty V0 set
+/// - [`compute_empty_v1_tx_set_hash`]`(prev_hash)` — empty V1 set
+///
+/// Used by [`verify_tx_set_hashes_internal`](XdrVerificationManager::verify_tx_set_hashes_internal)
+/// to decide whether a missing transactions-file entry is acceptable.
 pub(crate) fn is_empty_tx_set_hash(expected: &[u8; 32], prev_hash: &[u8; 32]) -> bool {
     *expected == [0; 32]
         || *expected == compute_empty_v0_tx_set_hash(prev_hash)
@@ -616,6 +711,8 @@ pub fn parse_result_entries(
     parse_result_entries_for_checkpoint(decompressed_data, None)
 }
 
+/// Same as [`parse_result_entries`] but additionally rejects ledger sequences
+/// outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_result_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
@@ -673,7 +770,8 @@ pub(crate) fn parse_result_entries_for_checkpoint(
     Ok(hashes)
 }
 
-/// Decompress gzip data from a reader into an in-memory buffer.
+/// Decompress a gzipped reader into an in-memory `Vec<u8>`. No write side —
+/// thin wrapper over [`decompress_and_write_internal`] with `writer = None`.
 pub(crate) async fn decompress_to_buffer(
     path: &str,
     reader: Reader,
@@ -717,6 +815,8 @@ pub fn parse_transaction_entries(
     parse_transaction_entries_for_checkpoint(decompressed_data, None)
 }
 
+/// Same as [`parse_transaction_entries`] but additionally rejects ledger
+/// sequences outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_transaction_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
@@ -812,6 +912,29 @@ pub enum XdrParseResult {
     None,
 }
 
+/// Streaming core: read gzipped bytes from `reader`, optionally tee-write the
+/// raw (still-compressed) bytes to `writer`, and return the fully decompressed
+/// payload alongside the **unclosed** sink.
+///
+/// Pipeline:
+/// 1. Pull gzipped chunks from `reader`'s opendal stream.
+/// 2. For each chunk: forward the compressed bytes to `sink` (if present), and
+///    push them through an mpsc channel into a spawned decompression task.
+/// 3. The decompression task feeds the channel through a `GzipDecoder` and
+///    accumulates the decompressed bytes into a `Vec<u8>`.
+/// 4. When the source stream ends, the channel closes and the decompression
+///    task returns.
+///
+/// **Sink lifecycle**: the returned sink is *not* closed. The caller closes it
+/// only after additional verification (e.g. XDR parse) succeeds — that way a
+/// post-write verification failure can `drop(sink)` and avoid committing
+/// corrupt data on atomic-write backends. On non-atomic backends, partial data
+/// is already on disk via `sink.send`, so the caller must additionally call
+/// [`cleanup_non_atomic_partial_write`] on failure.
+///
+/// Errors:
+/// - **Retry**: malformed gzip framing (decompression error)
+/// - **Fatal**: storage I/O error on read or write, or decompress task panic
 async fn decompress_and_write_internal(
     path: &str,
     reader: Reader,
@@ -902,10 +1025,15 @@ async fn decompress_and_write_internal(
     Ok((decompressed, sink))
 }
 
-/// On non-atomic backends, data sent via `sink.send()` is written directly to
-/// the target path. If the write is abandoned (sink dropped without close),
-/// the partial file must be removed. On atomic backends the sink drop alone
-/// prevents the temp-to-target rename, so no file cleanup is needed.
+/// Remove a partially-written file after a verified-write fails.
+///
+/// - **Atomic backends**: no-op — dropping the sink without `close()` already
+///   prevents the temp-to-target rename, so nothing landed at `path`.
+/// - **Non-atomic backends**: data sent via `sink.send()` is written directly
+///   to `path`, so the abandoned partial file is `tokio::fs::remove_file`'d.
+///   `NotFound` is silently tolerated; other errors are warned but not raised.
+///
+/// Safe to call on backends without a base path (e.g. HTTP) — does nothing.
 async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
     if dst_store.uses_atomic_writes() {
         return;
@@ -924,9 +1052,24 @@ async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
     }
 }
 
-/// Decompress, verify XDR structure, and write to destination in a single streaming pass.
-/// The file type is determined from `path` (ledger, transaction, result, or SCP).
-/// Returns the parsed hashes for the caller to record with [`XdrVerificationManager`].
+/// Decompress, verify XDR structure, and write to destination in a single
+/// streaming pass.
+///
+/// File type is inferred from `path`:
+/// - **ledger** → `XdrParseResult::Ledger` with per-ledger hashes
+/// - **transactions** → `XdrParseResult::Transactions`
+/// - **results** → `XdrParseResult::Results`
+/// - **scp** → `XdrParseResult::None` (frame structure validated, no hashes)
+/// - other → `XdrParseResult::None`
+///
+/// Atomicity: the sink is closed (committing the write) only after the
+/// in-memory decompressed payload parses successfully. On parse or
+/// decompression failure the sink is dropped without close; for non-atomic
+/// backends the partial file is additionally removed on disk.
+///
+/// Caller passes the returned hashes to
+/// [`XdrVerificationManager::record_*`](XdrVerificationManager) for
+/// cross-file verification.
 pub async fn verify_and_write_xdr(
     path: &str,
     reader: Reader,
@@ -934,18 +1077,29 @@ pub async fn verify_and_write_xdr(
 ) -> Result<XdrParseResult, StorageError> {
     use futures_util::SinkExt;
 
-    let writer = dst_store.open_writer(path).await?;
-    let (decompressed, sink) = match decompress_and_write_internal(path, reader, Some(writer)).await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // Decompression or I/O error — sink was dropped inside
-            // decompress_and_write_internal without close. Clean up any
-            // partial data on non-atomic backends.
-            cleanup_non_atomic_partial_write(path, dst_store).await;
-            return Err(e);
-        }
+    // For non-atomic backends, write to a `.tmp` sibling first and rename to
+    // `path` only after parsing succeeds. This prevents a partial file from
+    // being visible at the final path if the process is killed mid-stream
+    // (SIGKILL, OOM), which would otherwise cause `pre_check()` to skip
+    // re-downloading on resume. Atomic backends handle this internally.
+    let write_path: String = if dst_store.uses_atomic_writes() {
+        path.to_string()
+    } else {
+        format!("{path}.tmp")
     };
+
+    let writer = dst_store.open_writer(&write_path).await?;
+    let (decompressed, sink) =
+        match decompress_and_write_internal(&write_path, reader, Some(writer)).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Decompression or I/O error — sink was dropped inside
+                // decompress_and_write_internal without close. Clean up any
+                // partial data on non-atomic backends.
+                cleanup_non_atomic_partial_write(&write_path, dst_store).await;
+                return Err(e);
+            }
+        };
 
     let parse_result = if crate::history_format::is_ledger_file(path) {
         parse_ledger_entries_for_checkpoint(
@@ -975,9 +1129,26 @@ pub async fn verify_and_write_xdr(
         Ok(result) => {
             // Verification passed — close sink to commit the write
             if let Some(mut s) = sink {
-                s.close()
-                    .await
-                    .map_err(|e| from_opendal_error(e, &format!("failed to close {}", path)))?;
+                s.close().await.map_err(|e| {
+                    from_opendal_error(e, &format!("failed to close {}", write_path))
+                })?;
+            }
+            // Non-atomic FS backend: rename the temp to the final path.
+            // Removes the temp on rename failure to avoid leaking `.tmp` files.
+            if write_path != path {
+                if let Some(base) = dst_store.get_base_path() {
+                    let tmp_full = base.join(&write_path);
+                    let final_full = base.join(path);
+                    if let Err(e) = tokio::fs::rename(&tmp_full, &final_full).await {
+                        let _ = tokio::fs::remove_file(&tmp_full).await;
+                        return Err(StorageError::fatal(format!(
+                            "failed to rename {} to {}: {}",
+                            tmp_full.display(),
+                            final_full.display(),
+                            e
+                        )));
+                    }
+                }
             }
             Ok(result)
         }
@@ -985,7 +1156,7 @@ pub async fn verify_and_write_xdr(
             // Verification failed — don't close sink, prevents committing corrupt data
             // on atomic backends. For non-atomic backends, data is already on disk via
             // send() so clean up the partial file.
-            cleanup_non_atomic_partial_write(path, dst_store).await;
+            cleanup_non_atomic_partial_write(&write_path, dst_store).await;
             Err(err)
         }
     }
