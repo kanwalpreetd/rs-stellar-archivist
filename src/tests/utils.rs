@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -46,6 +46,34 @@ pub fn test_archive_path() -> PathBuf {
 
 pub fn testnet_small_archive_path() -> PathBuf {
     archive_path("testnet-archive-small")
+}
+
+// The fixture straddles the SCP boundary (`FIRST_SCP_CHECKPOINT`, the first
+// pubnet checkpoint that archives an scp): four checkpoints below it (in the
+// gap, no scp) and four at/above it (scp present).
+use crate::history_format::{CHECKPOINT_FREQUENCY, FIRST_SCP_CHECKPOINT};
+
+/// Lowest checkpoint in the fixture — four checkpoints below the boundary.
+pub const PUBNET_SCP_BOUNDARY_LOW: u32 = FIRST_SCP_CHECKPOINT - 4 * CHECKPOINT_FREQUENCY;
+/// Highest checkpoint in the fixture — three checkpoints above the boundary.
+pub const PUBNET_SCP_BOUNDARY_HIGH: u32 = FIRST_SCP_CHECKPOINT + 3 * CHECKPOINT_FREQUENCY;
+/// Last checkpoint in the gap (one below the boundary): pubnet has no scp here.
+pub const PUBNET_SCP_BOUNDARY_BELOW_CP: u32 = FIRST_SCP_CHECKPOINT - CHECKPOINT_FREQUENCY;
+/// The boundary itself — the first checkpoint that HAS an scp on pubnet.
+pub const PUBNET_SCP_BOUNDARY_AT_CP: u32 = FIRST_SCP_CHECKPOINT;
+
+/// Real pubnet slice straddling the early-SCP-gap boundary
+/// (`FIRST_SCP_CHECKPOINT` = 1_214_079). Covers checkpoints
+/// [`PUBNET_SCP_BOUNDARY_LOW`, `PUBNET_SCP_BOUNDARY_HIGH`]: the four below the
+/// boundary genuinely have no `scp-*` file on pubnet (never archived), the four
+/// at/above it do. Its root `.well-known` carries the pubnet networkPassphrase.
+pub fn pubnet_scp_boundary_archive_path() -> PathBuf {
+    archive_path("pubnet-archive-scp-boundary")
+}
+
+/// Copy the pubnet SCP-boundary slice to a destination directory.
+pub fn copy_pubnet_scp_boundary_archive(dst: &Path) -> Result<(), std::io::Error> {
+    copy_archive(&pubnet_scp_boundary_archive_path(), dst)
 }
 
 fn copy_archive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
@@ -88,6 +116,21 @@ pub fn copy_test_archive(dst: &Path) -> Result<(), std::io::Error> {
 pub fn copy_testnet_small_archive(dst: &Path) -> Result<(), std::io::Error> {
     let src = testnet_small_archive_path();
     copy_archive(&src, dst)
+}
+
+/// Rewrite the `networkPassphrase` in a local archive's root `.well-known` file,
+/// so a fixture can be presented as a given network (e.g. pubnet) to exercise the
+/// network-gated early-SCP-gap tolerance. Preserves every other field.
+pub fn set_network_passphrase(archive_dir: &Path, passphrase: &str) {
+    let path = archive_dir.join(crate::history_format::ROOT_WELL_KNOWN_PATH);
+    let content = std::fs::read_to_string(&path).expect("read .well-known");
+    let mut json: serde_json::Value = serde_json::from_str(&content).expect("parse .well-known");
+    json["networkPassphrase"] = serde_json::Value::String(passphrase.to_string());
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).expect("serialize"),
+    )
+    .expect("write .well-known");
 }
 
 /// Get all files of a specific type from the archive
@@ -497,10 +540,10 @@ pub fn parse_transaction_entries(
 
 pub(crate) fn read_and_parse_ledger_file(
     path: &Path,
-) -> Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry> {
+) -> Vec<stellar_xdr::LedgerHeaderHistoryEntry> {
     use flate2::read::GzDecoder;
     use std::io::Read as _;
-    use stellar_xdr::curr::{Frame, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr};
+    use stellar_xdr::{Frame, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr};
 
     let data = std::fs::read(path).expect("Failed to read ledger file");
     let mut decoder = GzDecoder::new(&data[..]);
@@ -517,9 +560,9 @@ pub(crate) fn read_and_parse_ledger_file(
         .collect()
 }
 
-pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::curr::LedgerHeaderHistoryEntry) {
+pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::LedgerHeaderHistoryEntry) {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, WriteXdr};
 
     let header_xdr = entry
         .header
@@ -530,12 +573,12 @@ pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::curr::LedgerHeaderHi
 
 pub(crate) fn write_ledger_header_entries_to_file(
     path: &Path,
-    entries: &[stellar_xdr::curr::LedgerHeaderHistoryEntry],
+    entries: &[stellar_xdr::LedgerHeaderHistoryEntry],
 ) {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write as _;
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, WriteXdr};
 
     let mut data = Vec::new();
     for entry in entries {
