@@ -5,9 +5,9 @@ use stellar_xdr::Hash;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::history_format::{self, HistoryFileState};
+use crate::history_format::{self, HistoryFileState, ROOT_WELL_KNOWN_PATH};
 use crate::pipeline;
-use crate::storage::StorageRef;
+use crate::storage::{ErrorClass, StorageRef};
 use crate::xdr_verify::VerificationErrorType;
 
 //=============================================================================
@@ -55,6 +55,9 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error(transparent)]
+    Storage(#[from] crate::storage::Error),
+
     #[error("History format error: {0}")]
     HistoryFormat(#[from] crate::history_format::Error),
 
@@ -71,6 +74,15 @@ pub enum Error {
         low_checkpoint: u32,
         high_checkpoint: u32,
     },
+}
+
+impl Error {
+    /// True when the storage backend reported the object absent — the only
+    /// error that means "the archive doesn't have this file".
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::Storage(e) if e.class == crate::storage::ErrorClass::NotFound)
+    }
 }
 
 /// Helper function to map pipeline errors to library errors
@@ -271,6 +283,36 @@ pub(crate) fn hex_to_hash(s: &str) -> Option<Hash> {
     Some(Hash(arr))
 }
 
+/// Which repair stage a completion report belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairStage {
+    /// The initial pass that audits the destination and re-fetches what it
+    /// can. Also the only pass a `--dry-run` performs.
+    Main,
+    /// Re-fetch of every file and bucket recorded as failed.
+    FileRetry,
+    /// Re-mirror of every checkpoint that failed cross-file or chain checks.
+    CheckpointRetry,
+}
+
+impl RepairStage {
+    fn label(self) -> &'static str {
+        match self {
+            RepairStage::Main => "main pass",
+            RepairStage::FileRetry => "file retry",
+            RepairStage::CheckpointRetry => "checkpoint retry",
+        }
+    }
+}
+
+/// Which operation a completion report describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportKind {
+    Scan,
+    Mirror,
+    Repair(RepairStage),
+}
+
 /// Shared archive operation statistics. The `failures` field is the
 /// deterministic source of truth for the operation's outcome and may be
 /// consulted to drive subsequent decisions (e.g. repair retry planning).
@@ -365,16 +407,24 @@ impl ArchiveStats {
         !self.failures.lock().await.is_empty()
     }
 
+    /// Total number of distinct problems found: broken files, bad buckets,
+    /// inconsistent checkpoints, and the root `.well-known` if unreadable.
+    pub async fn issue_count(&self) -> usize {
+        let f = self.failures.lock().await;
+        f.total_file_failures() as usize
+            + f.buckets.len()
+            + f.checkpoints.len()
+            + usize::from(f.well_known.is_some())
+    }
+
     /// Number of checkpoints flagged by cross-file or cross-checkpoint
-    /// verification. These are detected *after* the per-cp files are written, so
-    /// a non-zero count means individually-valid files were committed but are
-    /// mutually inconsistent.
+    /// verification.
     pub async fn checkpoint_failure_count(&self) -> usize {
         self.failures.lock().await.checkpoints.len()
     }
 
     /// Generate and log a complete report of the operation results.
-    pub async fn report(&self, operation: &str) {
+    pub async fn report(&self, kind: ReportKind) {
         let successful = self.successful_files.load(Ordering::Relaxed);
         let skipped = self.skipped_files.load(Ordering::Relaxed);
         let retries = self.retry_count.load(Ordering::Relaxed);
@@ -385,14 +435,17 @@ impl ArchiveStats {
         let checkpoint_failures = failures.checkpoints.len() as u32;
         let total_failures = total_file_failures + total_bucket_failures;
 
-        match operation {
-            "mirror" => info!(
+        match kind {
+            ReportKind::Mirror => info!(
                 "Mirror completed: {successful} files copied, {total_failures} failed, {skipped} skipped"
             ),
-            "repair" => info!(
-                "Repair completed: {successful} files processed, {total_failures} failed"
+            ReportKind::Repair(stage) => info!(
+                "Repair {} completed: {successful} files processed, {total_failures} failed",
+                stage.label()
             ),
-            _ => info!("Scan complete: {successful} files found, {total_failures} missing"),
+            ReportKind::Scan => {
+                info!("Scan complete: {successful} files found, {total_failures} missing or corrupt");
+            }
         }
 
         debug!(
@@ -414,22 +467,22 @@ impl ArchiveStats {
         let missing_results = failures.count_files(FileFlags::RESULTS);
         let missing_scp = failures.count_files(FileFlags::SCP);
         if missing_history > 0 {
-            error!("Missing {missing_history} history files");
+            error!("{missing_history} history file(s) missing or corrupt");
         }
         if missing_ledger > 0 {
-            error!("Missing {missing_ledger} ledger header files");
+            error!("{missing_ledger} ledger header file(s) missing or corrupt");
         }
         if missing_transactions > 0 {
-            error!("Missing {missing_transactions} transactions files");
+            error!("{missing_transactions} transactions file(s) missing or corrupt");
         }
         if missing_results > 0 {
-            error!("Missing {missing_results} results files");
+            error!("{missing_results} results file(s) missing or corrupt");
         }
         if total_bucket_failures > 0 {
-            error!("Missing {total_bucket_failures} bucket files");
+            error!("{total_bucket_failures} bucket file(s) missing or corrupt");
         }
         if missing_scp > 0 {
-            warn!("Missing {missing_scp} optional scp files");
+            warn!("{missing_scp} optional scp file(s) missing or corrupt");
         }
         if checkpoint_failures > 0 {
             error!("{checkpoint_failures} checkpoint(s) failed verification (cross-file or chain)");
@@ -469,8 +522,6 @@ impl RetryState {
         action: &str,
         path: &str,
     ) -> bool {
-        use crate::storage::ErrorClass;
-
         if error.class == ErrorClass::Retry {
             self.attempt += 1;
             if self.attempt <= self.max_retries {
@@ -484,6 +535,8 @@ impl RetryState {
                 "Exceeded {} retry attempts to {} {}: {}",
                 self.max_retries, action, path, error
             );
+        } else if error.class == ErrorClass::NotFound {
+            error!("Missing {path}");
         } else {
             error!("Failed to {} {}: {}", action, path, error);
         }
@@ -550,30 +603,41 @@ where
     }
 }
 
-/// Fetch and validate .well-known/stellar-history.json from store
+/// Probe the archive root `.well-known/stellar-history.json`.
 ///
-/// Parameters:
-/// - `store`: The storage backend to fetch from
-/// - `max_retries`: Maximum number of retry attempts (0 for no retries, e.g., for local filesystem)
-/// - `retry_min_delay_ms`: Initial backoff delay in milliseconds
-pub async fn fetch_well_known_history_file(
+/// Returns `Ok(None)` for a missing file. Every other failure (unreachable,
+/// unparseable, invalid) is still `Err`.
+pub(crate) async fn probe_well_known_history_file(
     store: &StorageRef,
     max_retries: u32,
     retry_min_delay_ms: u64,
-) -> Result<HistoryFileState, Error> {
-    use crate::history_format::ROOT_WELL_KNOWN_PATH;
-
+) -> Result<Option<HistoryFileState>, Error> {
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
+    // NotFound is absorbed here, inside the retried closure: it is never
+    // retryable, so this changes no retry behavior, and `should_retry` only
+    // ever sees reportable errors.
     let buffer = with_retries(
         max_retries,
         retry_min_delay_ms,
         "download",
         ROOT_WELL_KNOWN_PATH,
-        || crate::storage::download_buffer(store, ROOT_WELL_KNOWN_PATH),
+        || async {
+            match crate::storage::download_buffer(store, ROOT_WELL_KNOWN_PATH).await {
+                Err(e) if e.class == ErrorClass::NotFound => Ok(None),
+                r => r.map(Some),
+            }
+        },
     )
     .await
-    .map_err(|e| std::io::Error::other(format!("Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}")))?;
+    .map_err(|e| crate::storage::Error {
+        class: e.class,
+        message: format!("Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}"),
+    })?;
+
+    let Some(buffer) = buffer else {
+        return Ok(None);
+    };
 
     // Parse the JSON
     tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);
@@ -590,77 +654,133 @@ pub async fn fetch_well_known_history_file(
     // Validate the .well-known format
     state.validate()?;
 
-    Ok(state)
+    Ok(Some(state))
+}
+
+/// Fetch and validate .well-known/stellar-history.json from store.
+///
+/// A missing file is an error here (and is logged); callers that expect a
+/// possible absence use [`probe_well_known_history_file`] instead.
+///
+/// Parameters:
+/// - `store`: The storage backend to fetch from
+/// - `max_retries`: Maximum number of retry attempts (0 for no retries, e.g., for local filesystem)
+/// - `retry_min_delay_ms`: Initial backoff delay in milliseconds
+pub async fn fetch_well_known_history_file(
+    store: &StorageRef,
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+) -> Result<HistoryFileState, Error> {
+    probe_well_known_history_file(store, max_retries, retry_min_delay_ms)
+        .await?
+        .ok_or_else(|| {
+            error!("Missing {ROOT_WELL_KNOWN_PATH}");
+            crate::storage::Error {
+                class: crate::storage::ErrorClass::NotFound,
+                message: format!("Failed to fetch {ROOT_WELL_KNOWN_PATH}: file not found"),
+            }
+            .into()
+        })
 }
 
 /// Read the network passphrase from the archive root `.well-known` at `store`.
 ///
-/// Returns `None` if the file is unreachable or omits the passphrase. This is the
-/// single source of truth for network identity: it drives the pubnet-only
-/// early-SCP-gap tolerance (via [`history_format::is_pubnet_passphrase`]) and is
-/// stamped into mirrored/repaired `.well-known` files, since per-checkpoint
-/// history files omit the passphrase (only the archive root carries it).
-pub async fn fetch_source_network_passphrase(
+/// Returns `None` if the file doesn't exist or is unreachable or omits the passphrase.
+pub(crate) async fn fetch_source_network_passphrase(
     store: &StorageRef,
     storage_config: &crate::storage::StorageConfig,
 ) -> Option<String> {
-    match fetch_well_known_history_file(
+    match probe_well_known_history_file(
         store,
         storage_config.max_retries as u32,
         storage_config.retry_min_delay.as_millis() as u64,
     )
     .await
     {
-        Ok(state) => state.network_passphrase,
+        Ok(Some(state)) => state.network_passphrase,
+        Ok(None) => {
+            debug!("Source has no root .well-known");
+            None
+        }
         Err(e) => {
-            // Not fatal here: a genuinely unreachable .well-known also fails the
-            // operation's get_checkpoint_bounds loudly. But log so the "treated
-            // as non-pubnet, passphrase not stamped" path is observable.
             debug!("Could not read source .well-known network passphrase: {e}");
             None
         }
     }
 }
 
-/// Write `src_history_file` (a per-checkpoint history file) to `dst_well_known`,
-/// stamping in `network_passphrase` when `Some` so the mirrored/repaired archive
-/// root carries the network identity that per-checkpoint history files omit
-/// (only the archive root `.well-known` does). When `None` (the source archive
-/// itself had no passphrase) the file is copied verbatim. The caller is
-/// responsible for ensuring the destination parent directory exists.
-pub async fn write_well_known_from_history(
-    src_history_file: &std::path::Path,
-    dst_well_known: &std::path::Path,
+/// Stamp `network_passphrase` into history-file JSON bytes when needed, so a
+/// mirrored/repaired archive root carries the network identity that
+/// per-checkpoint history files omit (only the archive root `.well-known`
+/// does). Returns the bytes unchanged when no passphrase is given or the same
+/// value is already present; errors when the bytes are not a JSON object.
+pub(crate) fn stamp_network_passphrase(
+    contents: Vec<u8>,
     network_passphrase: Option<&str>,
-) -> std::io::Result<()> {
-    // Start from the source bytes; only replace them when the passphrase
-    // actually needs stamping (source has one and the history file lacks it or
-    // carries a different value).
-    let mut contents = tokio::fs::read(src_history_file).await?;
-
-    if let Some(passphrase) = network_passphrase {
-        let mut value: serde_json::Value = serde_json::from_slice(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let already_present =
-            value.get("networkPassphrase").and_then(|v| v.as_str()) == Some(passphrase);
-        if !already_present {
-            let obj = value.as_object_mut().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "history file is not a JSON object",
-                )
-            })?;
-            obj.insert(
-                "networkPassphrase".to_string(),
-                serde_json::Value::String(passphrase.to_string()),
-            );
-            contents = serde_json::to_vec_pretty(&value)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            contents.push(b'\n');
-        }
+) -> std::io::Result<Vec<u8>> {
+    let Some(passphrase) = network_passphrase else {
+        return Ok(contents);
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let already_present =
+        value.get("networkPassphrase").and_then(|v| v.as_str()) == Some(passphrase);
+    if already_present {
+        return Ok(contents);
     }
+    let obj = value.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "history file is not a JSON object",
+        )
+    })?;
+    obj.insert(
+        "networkPassphrase".to_string(),
+        serde_json::Value::String(passphrase.to_string()),
+    );
+    let mut out = serde_json::to_vec_pretty(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    out.push(b'\n');
+    Ok(out)
+}
 
-    tokio::fs::write(dst_well_known, contents).await
+/// Copy `history_path` (already present on `store`) to
+/// `.well-known/stellar-history.json` on the same store, stamping the network
+/// passphrase when provided. Works on any writable backend; the destination
+/// read and write are retried up to `max_retries` times.
+pub async fn update_well_known_from_history(
+    store: &crate::storage::StorageRef,
+    history_path: &str,
+    network_passphrase: Option<&str>,
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+) -> Result<(), crate::storage::Error> {
+    let buffer = with_retries(
+        max_retries,
+        retry_min_delay_ms,
+        "download",
+        history_path,
+        || crate::storage::download_buffer(store, history_path),
+    )
+    .await?;
+    let contents = stamp_network_passphrase(buffer.to_vec(), network_passphrase).map_err(|e| {
+        crate::storage::Error::fatal(format!(
+            "Failed to stamp network passphrase into {history_path}: {e}"
+        ))
+    })?;
+    with_retries(
+        max_retries,
+        retry_min_delay_ms,
+        "write",
+        crate::history_format::ROOT_WELL_KNOWN_PATH,
+        || {
+            store.write(
+                crate::history_format::ROOT_WELL_KNOWN_PATH,
+                contents.clone().into(),
+            )
+        },
+    )
+    .await
 }
 
 /// Compute checkpoint bounds using a pre-fetched source checkpoint

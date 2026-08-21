@@ -8,7 +8,6 @@
 //! - Request logging
 
 use async_trait::async_trait;
-use futures_util::SinkExt;
 use futures_util::StreamExt;
 use normalize_path::NormalizePath;
 use opendal::{layers, Buffer, ErrorKind, Operator, Reader, Writer};
@@ -63,32 +62,174 @@ impl Error {
 
 pub type StorageRef = Arc<dyn Storage + Send + Sync>;
 
-/// Stream all bytes from `reader` into `writer`, returning the number of bytes
-/// copied. Each chunk is parked into the sink with `feed` (start_send under
-/// poll_ready backpressure) without an intermediate flush; the single `close()`
-/// then flushes the buffered data and finalizes the write (uploads the final
-/// part / fsync+rename). This matches `Sink::send_all`'s deferred-flush
-/// behavior — avoiding a flush per chunk — while exposing the byte count.
-async fn copy_reader_to_writer(reader: Reader, writer: Writer, object: &str) -> Result<u64, Error> {
-    let mut stream = reader
-        .into_stream(..)
-        .await
-        .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
+/// Upload part/block size for object-store writes. Meets every backend's
+/// minimum part size (5 MiB on S3/GCS/B2), keeps large files under per-object
+/// part-count caps (50,000 blocks on Azure, 10,000 parts elsewhere), and
+/// bounds per-writer buffering.
+const OBJECT_STORE_WRITE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-    let mut copied_bytes = 0u64;
-    let mut sink = writer.into_sink();
-    while let Some(result) = stream.next().await {
-        let buffer = result
-            .map_err(|e| from_opendal_error(e, &format!("Failed to read data for {object}")))?;
-        copied_bytes += buffer.len() as u64;
-        sink.feed(buffer)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {object}")))?;
+/// A staged write: the data being written is not visible at the final object
+/// path until `commit()` succeeds; `abort()` (or dropping without commit)
+/// leaves the final path unchanged. Only an explicit `abort()` also cleans up
+/// staged data — a bare drop can leave a `.tmp` sibling (plain fs) or an
+/// unfinished multipart upload (object stores).
+pub struct StagedWriter {
+    inner: StagedInner,
+    /// Final object path (archive-relative), for error messages.
+    object: String,
+    bytes_written: u64,
+}
+
+enum StagedInner {
+    /// Backend commits atomically on `close()` — object stores and fs with
+    /// `atomic_write_dir`. commit = close; abort = best-effort backend abort.
+    AtomicOnClose { writer: Writer },
+    /// Plain filesystem: direct `tokio::fs` writes to a `.tmp` sibling; commit
+    /// = flush + rename; abort = remove the `.tmp`. No fsync or `OpenDAL`
+    /// write buffering.
+    FsStaged {
+        file: tokio::fs::File,
+        tmp_path: PathBuf,
+        final_path: PathBuf,
+    },
+}
+
+impl StagedWriter {
+    fn atomic_on_close(writer: Writer, object: &str) -> Self {
+        Self {
+            inner: StagedInner::AtomicOnClose { writer },
+            object: object.to_string(),
+            bytes_written: 0,
+        }
     }
-    sink.close()
-        .await
-        .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {object}")))?;
-    Ok(copied_bytes)
+
+    /// Stage at `<root>/<object>.tmp`, creating parent directories.
+    async fn fs_staged(root: &Path, object: &str) -> Result<Self, Error> {
+        let object_rel = object.trim_start_matches('/');
+        let final_path = root.join(object_rel);
+        let tmp_path = final_path.with_added_extension("tmp");
+
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                from_io_error(
+                    e,
+                    &format!("Failed to create directory {}", parent.display()),
+                )
+            })?;
+        }
+        let file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+            from_io_error(
+                e,
+                &format!("Failed to create temp file {}", tmp_path.display()),
+            )
+        })?;
+
+        Ok(Self {
+            inner: StagedInner::FsStaged {
+                file,
+                tmp_path,
+                final_path,
+            },
+            object: object.to_string(),
+            bytes_written: 0,
+        })
+    }
+
+    /// Append a chunk. Nothing becomes visible at the final path. On `Err` the
+    /// caller must `abort()` (or drop) the writer.
+    pub async fn write(&mut self, buffer: Buffer) -> Result<(), Error> {
+        self.bytes_written += buffer.len() as u64;
+        match &mut self.inner {
+            StagedInner::AtomicOnClose { writer } => writer.write(buffer).await.map_err(|e| {
+                from_opendal_error(e, &format!("Failed to write data to {}", self.object))
+            }),
+            StagedInner::FsStaged { file, tmp_path, .. } => {
+                for bytes in buffer {
+                    file.write_all(&bytes).await.map_err(|e| {
+                        from_io_error(e, &format!("Failed to write to {}", tmp_path.display()))
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Make the staged data visible at the final path. Returns bytes written.
+    pub async fn commit(self) -> Result<u64, Error> {
+        match self.inner {
+            StagedInner::AtomicOnClose { mut writer } => {
+                if let Err(e) = writer.close().await {
+                    // Best-effort backend abort; always return the original
+                    // close error.
+                    if let Err(abort_err) = writer.abort().await {
+                        tracing::warn!(
+                            "failed to abort staged upload for {} after a failed close: {}",
+                            self.object,
+                            abort_err
+                        );
+                    }
+                    return Err(from_opendal_error(
+                        e,
+                        &format!("Failed to close writer for {}", self.object),
+                    ));
+                }
+            }
+            StagedInner::FsStaged {
+                mut file,
+                tmp_path,
+                final_path,
+            } => {
+                let flushed = file.flush().await.map_err(|e| {
+                    from_io_error(e, &format!("Failed to flush {}", tmp_path.display()))
+                });
+                drop(file); // close the handle before renaming
+                if let Err(e) = flushed {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+                if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(from_io_error(
+                        e,
+                        &format!(
+                            "Failed to rename {} to {}",
+                            tmp_path.display(),
+                            final_path.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(self.bytes_written)
+    }
+
+    /// Discard the staged data, leaving the final path unchanged. Best-effort,
+    /// infallible.
+    pub async fn abort(self) {
+        match self.inner {
+            StagedInner::AtomicOnClose { mut writer } => {
+                if let Err(e) = writer.abort().await {
+                    tracing::warn!(
+                        "failed to discard staged upload for {} on abort: {}",
+                        self.object,
+                        e
+                    );
+                }
+            }
+            StagedInner::FsStaged { file, tmp_path, .. } => {
+                drop(file);
+                if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            "failed to remove staged temp {} after abort: {}",
+                            tmp_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Core unified storage trait for all backends
@@ -102,36 +243,60 @@ pub trait Storage: Send + Sync {
     /// Note: No automatic retries - retries are handled at the pipeline level.
     async fn exists(&self, object: &str) -> Result<bool, Error>;
 
-    /// Open an `OpenDAL` writer for the object with buffering enabled.
-    /// Only supported by writable backends (e.g., filesystem).
-    /// Caller is responsible for calling `writer.close()` after writing.
-    async fn open_writer(&self, _object: &str) -> Result<Writer, Error> {
+    /// Open a staged write to `object`: bytes become visible at the final
+    /// path only on `commit()`. Only supported by writable backends.
+    async fn open_staged_writer(&self, _object: &str) -> Result<StagedWriter, Error> {
         Err(Error::fatal("Write not supported by this backend"))
     }
 
     /// Write an entire buffer to an object.
-    /// This is a convenience method that opens a writer, writes, and closes.
-    /// Only supported by writable backends (e.g., filesystem).
+    /// Only supported by writable backends (filesystem and cloud object stores).
     async fn write(&self, object: &str, data: Buffer) -> Result<(), Error> {
-        let mut writer = self.open_writer(object).await?;
-        writer
-            .write(data)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to write to {object}")))?;
-        writer
-            .close()
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {object}")))?;
+        let mut writer = self.open_staged_writer(object).await?;
+        if let Err(e) = writer.write(data).await {
+            writer.abort().await;
+            return Err(e);
+        }
+        writer.commit().await?;
         Ok(())
     }
 
-    /// Copy data from a source reader to a destination object.
-    /// Streams data in chunks without buffering the entire file in memory.
-    /// Only supported by writable backends (e.g., filesystem).
+    /// Copy data from a source reader to a destination object, streaming in
+    /// chunks. Nothing is visible at the destination on failure.
+    /// Only supported by writable backends (filesystem and cloud object stores).
     async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<(), Error> {
         let copy_phase = crate::phase!(crate::metrics::Phase::Copy);
-        let writer = self.open_writer(object).await?;
-        let copied_bytes = copy_reader_to_writer(reader, writer, object).await?;
+        let mut writer = self.open_staged_writer(object).await?;
+
+        let mut stream = match reader.into_stream(..).await {
+            Ok(s) => s,
+            Err(e) => {
+                writer.abort().await;
+                return Err(from_opendal_error(
+                    e,
+                    &format!("Failed to create stream for {object}"),
+                ));
+            }
+        };
+
+        while let Some(result) = stream.next().await {
+            let buffer = match result {
+                Ok(b) => b,
+                Err(e) => {
+                    writer.abort().await;
+                    return Err(from_opendal_error(
+                        e,
+                        &format!("Failed to read data for {object}"),
+                    ));
+                }
+            };
+            if let Err(e) = writer.write(buffer).await {
+                writer.abort().await;
+                return Err(e);
+            }
+        }
+
+        let copied_bytes = writer.commit().await?;
         copy_phase.record_file(copied_bytes);
         Ok(())
     }
@@ -141,15 +306,10 @@ pub trait Storage: Send + Sync {
         false
     }
 
-    /// Get the base filesystem path if this is a filesystem backend
+    /// Get the base filesystem path if this is a filesystem backend.
+    /// Introspection only — production write paths never consult this.
     fn get_base_path(&self) -> Option<&std::path::Path> {
         None
-    }
-
-    /// Check if this backend uses atomic writes (temp file + rename).
-    /// When true, failed writes don't leave partial files at the destination.
-    fn uses_atomic_writes(&self) -> bool {
-        false
     }
 }
 
@@ -213,25 +373,27 @@ pub struct OpendalStore {
     root_path: Option<PathBuf>,
     /// Whether this backend supports writes
     writable: bool,
-    /// Whether to use atomic file writes (`OpenDAL` with fsync) vs direct writes (`tokio::fs` bypass)
-    atomic_file_writes: bool,
+    /// Whether writes are atomic (a failed write leaves nothing at the
+    /// destination path): true for object stores and for filesystem stores
+    /// using `atomic_write_dir`.
+    atomic_writes: bool,
 }
 
 impl OpendalStore {
     /// Create a new `OpendalStore` from a configured operator
-    fn from_operator(
+    pub(crate) fn from_operator(
         operator: Operator,
         prefix: impl Into<String>,
         root_path: Option<PathBuf>,
         writable: bool,
-        atomic_file_writes: bool,
+        atomic_writes: bool,
     ) -> Self {
         Self {
             operator,
             prefix: prefix.into(),
             root_path,
             writable,
-            atomic_file_writes,
+            atomic_writes,
         }
     }
 
@@ -298,87 +460,6 @@ impl OpendalStore {
             let prefix = self.prefix.trim_end_matches('/');
             format!("{prefix}/{object}")
         }
-    }
-
-    /// Direct file write that bypasses `OpenDAL`'s writer layer. This avoids
-    /// the `WriteGenerator` buffering and the fsync in `close()`.
-    ///
-    /// Writes to a `.tmp` file first, then renames to the final path. This
-    /// prevents partial files from being visible at the final path if the
-    /// process is killed mid-write (SIGKILL, OOM etc.). Without this, a resumed
-    /// mirror would see the partial file via `pre_check()` and skip
-    /// re-downloading it.
-    async fn copy_from_reader_direct(
-        &self,
-        root_path: &Path,
-        object: &str,
-        reader: Reader,
-    ) -> Result<u64, Error> {
-        let object = object.trim_start_matches('/');
-        let file_path = root_path.join(object);
-        let tmp_path = file_path.with_added_extension("tmp");
-
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                from_io_error(
-                    e,
-                    &format!("Failed to create directory {}", parent.display()),
-                )
-            })?;
-        }
-
-        let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-            from_io_error(
-                e,
-                &format!("Failed to create temp file {}", tmp_path.display()),
-            )
-        })?;
-
-        let mut stream = reader
-            .into_stream(..)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
-
-        let write_result: Result<u64, Error> = async {
-            let mut copied_bytes = 0u64;
-            while let Some(result) = stream.next().await {
-                let buffer =
-                    result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
-                copied_bytes += buffer.len() as u64;
-                for bytes in buffer {
-                    file.write_all(&bytes).await.map_err(|e| {
-                        from_io_error(e, &format!("Failed to write to {}", tmp_path.display()))
-                    })?;
-                }
-            }
-            file.flush().await.map_err(|e| {
-                from_io_error(e, &format!("Failed to flush {}", tmp_path.display()))
-            })?;
-            Ok(copied_bytes)
-        }
-        .await;
-
-        let copied_bytes = match write_result {
-            Ok(copied_bytes) => copied_bytes,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = tokio::fs::rename(&tmp_path, &file_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(from_io_error(
-                e,
-                &format!(
-                    "Failed to rename {} to {}",
-                    tmp_path.display(),
-                    file_path.display()
-                ),
-            ));
-        }
-
-        Ok(copied_bytes)
     }
 
     // ===== Filesystem Backend =====
@@ -496,7 +577,7 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-        Ok(Self::from_operator(operator, prefix, None, false, false))
+        Ok(Self::from_operator(operator, prefix, None, true, true))
     }
 
     /// Create a Google Cloud Storage backend
@@ -519,7 +600,7 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-        Ok(Self::from_operator(operator, prefix, None, false, false))
+        Ok(Self::from_operator(operator, prefix, None, true, true))
     }
 
     /// Create an Azure Blob Storage backend
@@ -546,7 +627,7 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-        Ok(Self::from_operator(operator, prefix, None, false, false))
+        Ok(Self::from_operator(operator, prefix, None, true, true))
     }
 
     /// Create a Backblaze B2 storage backend
@@ -568,7 +649,7 @@ impl OpendalStore {
             .application_key(application_key);
 
         let operator = Self::apply_layers(builder, config)?;
-        Ok(Self::from_operator(operator, prefix, None, false, false))
+        Ok(Self::from_operator(operator, prefix, None, true, true))
     }
 
     /// Create an SFTP storage backend
@@ -598,7 +679,10 @@ impl OpendalStore {
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
-    /// Create an `OpenStack` Swift storage backend
+    /// Create an `OpenStack` Swift storage backend.
+    ///
+    /// Read-only: opendal's Swift writer uploads an object in a single
+    /// request and cannot stream archive-sized files.
     #[cfg(feature = "opendal-swift")]
     pub fn swift(
         container: &str,
@@ -740,46 +824,35 @@ impl Storage for OpendalStore {
         }
     }
 
-    async fn open_writer(&self, object: &str) -> Result<Writer, Error> {
+    async fn open_staged_writer(&self, object: &str) -> Result<StagedWriter, Error> {
         if !self.writable {
             return Err(Error::fatal("Write not supported by this backend"));
         }
-
-        let key = self.object_to_key(object);
-
-        // Use writer_with to enable buffered/chunked writing for better performance
-        // All backends write through OpenDAL, which applies ConcurrentLimitLayer
-        // Filesystem backends use atomic_write_dir for atomic writes (temp file + rename)
-        let writer = self.operator.writer_with(&key).await.map_err(|e| {
-            let class = classify_opendal_error(&e);
-            Error {
-                class,
-                message: format!("Failed to open writer for {key}: {e}"),
+        if self.atomic_writes {
+            let key = self.object_to_key(object);
+            let mut writer_fut = self.operator.writer_with(&key);
+            // Object stores need an explicit chunk size: without one, every
+            // incoming stream chunk becomes its own upload part, and azblob
+            // (no service-declared minimum) would exceed Azure's 50,000-block
+            // cap on large files. Filesystem writers stream through unchanged.
+            if self.root_path.is_none() {
+                writer_fut = writer_fut.chunk(OBJECT_STORE_WRITE_CHUNK_SIZE);
             }
-        })?;
-
-        Ok(writer)
-    }
-
-    async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<(), Error> {
-        let copy_phase = crate::phase!(crate::metrics::Phase::Copy);
-        // If we have a filesystem root and atomic writes are disabled, use direct tokio::fs writes
-        // to bypass OpenDAL's WriteGenerator buffering and avoid the fsync in close().
-        if let Some(root_path) = &self.root_path {
-            if !self.atomic_file_writes {
-                let copied_bytes = self
-                    .copy_from_reader_direct(root_path, object, reader)
-                    .await?;
-                copy_phase.record_file(copied_bytes);
-                return Ok(());
-            }
+            let writer = writer_fut.await.map_err(|e| {
+                let class = classify_opendal_error(&e);
+                Error {
+                    class,
+                    message: format!("Failed to open writer for {key}: {e}"),
+                }
+            })?;
+            Ok(StagedWriter::atomic_on_close(writer, object))
+        } else {
+            // Plain fs is the only non-atomic writable backend; it always has a root.
+            let root = self.root_path.as_ref().ok_or_else(|| {
+                Error::fatal("Non-atomic backend without a filesystem root cannot stage writes")
+            })?;
+            StagedWriter::fs_staged(root, object).await
         }
-
-        // Otherwise use OpenDAL's writer (required for non-filesystem backends or when atomic writes are enabled)
-        let writer = self.open_writer(object).await?;
-        let copied_bytes = copy_reader_to_writer(reader, writer, object).await?;
-        copy_phase.record_file(copied_bytes);
-        Ok(())
     }
 
     fn supports_writes(&self) -> bool {
@@ -788,10 +861,6 @@ impl Storage for OpendalStore {
 
     fn get_base_path(&self) -> Option<&Path> {
         self.root_path.as_deref()
-    }
-
-    fn uses_atomic_writes(&self) -> bool {
-        self.atomic_file_writes
     }
 }
 
@@ -805,7 +874,7 @@ impl Storage for OpendalStore {
 /// - `gcs://bucket/prefix` - Google Cloud Storage (uses `GOOGLE_APPLICATION_CREDENTIALS` env var)
 /// - `azblob://container/prefix` - Azure Blob Storage (uses `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY` env vars)
 /// - `b2://bucket/prefix` - Backblaze B2 (uses `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET_ID` env vars)
-/// - `swift://container/prefix` - `OpenStack` Swift (uses `SWIFT_ENDPOINT`, `SWIFT_TOKEN` env vars)
+/// - `swift://container/prefix` - `OpenStack` Swift, read-only (uses `SWIFT_ENDPOINT`, `SWIFT_TOKEN` env vars)
 /// - `sftp://[user@]host[:port]/path` - SFTP (uses `SFTP_USER`, `SFTP_KEY` env vars)
 ///
 /// Creates a backend from a URL string with configuration.
@@ -1072,44 +1141,4 @@ pub async fn download_buffer(store: &StorageRef, path: &str) -> Result<opendal::
         .await
         .map_err(|e| from_opendal_error(e, "Read error"))?;
     Ok(chunks.into_iter().flatten().collect())
-}
-
-/// Write `buffer` to `store` at `path`. On write failure, attempt to clean up
-/// any partial file left behind (logging but not propagating cleanup errors)
-/// and return the original write error.
-pub async fn write_buffer_with_cleanup(
-    store: &StorageRef,
-    path: &str,
-    buffer: opendal::Buffer,
-) -> Result<(), Error> {
-    match store.write(path, buffer).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            if let Err(cleanup_err) = cleanup_partial_file(store, path).await {
-                tracing::error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Clean up a partial file on the destination after a write failure.
-/// No-op on atomic-write backends (temp file is discarded automatically).
-pub async fn cleanup_partial_file(store: &StorageRef, path: &str) -> Result<(), Error> {
-    if store.uses_atomic_writes() {
-        return Ok(());
-    }
-    if let Some(base_path) = store.get_base_path() {
-        let file_path = base_path.join(path);
-        if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
-            tokio::fs::remove_file(&file_path).await.map_err(|e| {
-                Error::fatal(format!(
-                    "Failed to remove partial file {}: {}",
-                    file_path.display(),
-                    e
-                ))
-            })?;
-        }
-    }
-    Ok(())
 }
