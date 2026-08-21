@@ -7,6 +7,8 @@ mod http_retry_test;
 #[cfg(test)]
 mod mirror_op_test;
 #[cfg(test)]
+mod object_store_write_test;
+#[cfg(test)]
 mod path_normalization_test;
 #[cfg(test)]
 mod pipeline_test;
@@ -18,6 +20,8 @@ mod repair_op_test;
 mod report_test;
 #[cfg(test)]
 mod scan_op_test;
+#[cfg(test)]
+mod staged_writer_test;
 #[cfg(test)]
 pub(crate) mod utils;
 #[cfg(test)]

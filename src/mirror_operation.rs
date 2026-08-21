@@ -2,8 +2,11 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
-use crate::storage::{self, Error as StorageError, StorageRef};
-use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
+use crate::utils::{
+    compute_checkpoint_bounds, fetch_well_known_history_file, probe_well_known_history_file,
+    ArchiveStats, ReportKind,
+};
 use crate::xdr_verify::XdrVerificationManager;
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -92,14 +95,14 @@ impl MirrorOperation {
         }
     }
 
-    /// Get the destination's initial checkpoint from .well-known file, caching the result
-    /// Returns None if destination doesn't have a .well-known file
-    async fn get_initial_dest_well_known_checkpoint(&self) -> Option<u32> {
-        *self
-            .initial_dest_checkpoint
-            .get_or_init(|| async {
-                // Try to read the destination's .well-known file
-                match fetch_well_known_history_file(
+    /// Get the destination's initial checkpoint from .well-known, caching the
+    /// result. `Ok(None)` means the destination has no .well-known (fresh
+    /// archive). Anything else — a present-but-unparseable .well-known, or a
+    /// storage error other than `NotFound` — is an `Err`.
+    async fn get_initial_dest_well_known_checkpoint(&self) -> Result<Option<u32>, Error> {
+        self.initial_dest_checkpoint
+            .get_or_try_init(|| async {
+                match probe_well_known_history_file(
                     &self.dst_store,
                     self.pipeline_config.storage_config.max_retries as u32,
                     self.pipeline_config
@@ -109,11 +112,13 @@ impl MirrorOperation {
                 )
                 .await
                 {
-                    Ok(has) => Some(has.current_ledger),
-                    Err(_) => None, // No existing archive
+                    Ok(Some(has)) => Ok(Some(has.current_ledger)),
+                    Ok(None) => Ok(None), // No existing archive
+                    Err(e) => Err(e.into()),
                 }
             })
             .await
+            .copied()
     }
 
     async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<(), Error> {
@@ -123,7 +128,7 @@ impl MirrorOperation {
         // 2. The new checkpoint is higher than the existing .well-known file
 
         let should_update = if let Some(existing_ledger) =
-            self.get_initial_dest_well_known_checkpoint().await
+            self.get_initial_dest_well_known_checkpoint().await?
         {
             let existing_checkpoint = history_format::round_to_lower_checkpoint(existing_ledger);
             if highest_checkpoint > existing_checkpoint {
@@ -154,58 +159,42 @@ impl MirrorOperation {
         if should_update {
             // Copy the history file at the specified checkpoint to be our .well-known file
             let history_path = history_format::checkpoint_path("history", highest_checkpoint);
-            let well_known_path = ".well-known/stellar-history.json";
 
-            let dst_base = self.dst_store.get_base_path().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Destination storage backend does not have a filesystem path",
-                )
-            })?;
-
-            let src_file = dst_base.join(&history_path);
-            let dst_file = dst_base.join(well_known_path);
+            let max_retries = self.pipeline_config.storage_config.max_retries as u32;
+            let retry_min_delay_ms = self
+                .pipeline_config
+                .storage_config
+                .retry_min_delay
+                .as_millis() as u64;
 
             // Check if the history file exists (it might not if the mirror had failures)
-            if !tokio::fs::try_exists(&src_file).await.unwrap_or(false) {
+            if !crate::utils::with_retries(
+                max_retries,
+                retry_min_delay_ms,
+                "probe",
+                &history_path,
+                || self.dst_store.exists(&history_path),
+            )
+            .await?
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!(
                         "Cannot update .well-known: history file at checkpoint {} (0x{:08x}) was not successfully mirrored ({})",
-                        highest_checkpoint, highest_checkpoint,
-                        src_file.display()
+                        highest_checkpoint, highest_checkpoint, history_path
                     ),
                 )
                 .into());
             }
 
-            // Ensure the .well-known directory exists
-            if let Some(parent) = dst_file.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to create directory {}: {}", parent.display(), e),
-                    )
-                })?;
-            }
-
-            crate::utils::write_well_known_from_history(
-                &src_file,
-                &dst_file,
+            crate::utils::update_well_known_from_history(
+                &self.dst_store,
+                &history_path,
                 self.pipeline_config.source_network_passphrase.as_deref(),
+                max_retries,
+                retry_min_delay_ms,
             )
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to write .well-known {} from {}: {}",
-                        dst_file.display(),
-                        src_file.display(),
-                        e
-                    ),
-                )
-            })?;
+            .await?;
 
             info!(
                 "Updated destination .well-known to checkpoint {} (0x{:08x})",
@@ -246,7 +235,10 @@ impl Operation for MirrorOperation {
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
-        let dest_checkpoint_opt = self.get_initial_dest_well_known_checkpoint().await;
+        let dest_checkpoint_opt = self
+            .get_initial_dest_well_known_checkpoint()
+            .await
+            .map_err(crate::pipeline::Error::MirrorOperation)?;
 
         // Determine the target checkpoint (limited by source and --high if specified)
         let target_checkpoint = if let Some(high) = self.high {
@@ -321,8 +313,8 @@ impl Operation for MirrorOperation {
                     }
                 }
             } else {
-                debug!(
-                    "Destination archive does not exist, proceeding with --low {}",
+                info!(
+                    "No existing archive at destination; starting a fresh mirror from --low {}",
                     requested_low
                 );
                 // No destination archive, use the requested low
@@ -344,7 +336,7 @@ impl Operation for MirrorOperation {
                 );
                 Some(next_checkpoint)
             } else {
-                debug!("Destination archive does not exist, starting from beginning");
+                info!("No existing archive at destination; starting a fresh mirror");
                 None
             }
         };
@@ -373,7 +365,7 @@ impl Operation for MirrorOperation {
         stats: &ArchiveStats,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
-        stats.report("mirror").await;
+        stats.report(ReportKind::Mirror).await;
 
         if let Some(path) = report_path {
             let report = crate::report::ArchiveReport {
@@ -421,14 +413,21 @@ impl Operation for MirrorOperation {
     async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
         // Symmetric with process_object's `exists && !overwrite => Skipped`.
         if !self.overwrite {
-            if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
-                if let Ok(state) = history_format::parse_history(&buffer, path) {
-                    return Ok(HistoryOutcome {
-                        outcome: ProcessOutcome::Skipped,
-                        state: Some(state),
-                    });
+            match storage::download_buffer(&self.dst_store, path).await {
+                Ok(buffer) => {
+                    if let Ok(state) = history_format::parse_history(&buffer, path) {
+                        return Ok(HistoryOutcome {
+                            outcome: ProcessOutcome::Skipped,
+                            state: Some(state),
+                        });
+                    }
+                    // present but unparseable -> fall through and re-fetch from source
                 }
-                // present but unparseable -> fall through and re-fetch from source
+                // Missing -> fall through and fetch from source.
+                Err(e) if e.class == ErrorClass::NotFound => {}
+                // Any other destination error is not "absent" — surface it so
+                // the pipeline's retry/failure handling sees it.
+                Err(e) => return Err(e),
             }
         }
 
@@ -444,7 +443,7 @@ impl Operation for MirrorOperation {
             history_format::parse_history(&buffer, path)
         }
         .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
-        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
+        self.dst_store.write(path, buffer).await?;
         Ok(HistoryOutcome {
             outcome: ProcessOutcome::Processed,
             state: Some(state),
